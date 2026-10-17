@@ -2,9 +2,10 @@
  * Host-half unit tests for dsh-agent-team-console.
  *
  * Plain `node --test` (no dependencies): imports the exported helpers from
- * ../index.js and drives them against fake Cordis services. Covers the snapshot
- * contract, defensive `team/member` + `team/task` normalization, JSON safety,
- * and the route's 200/404/500 behavior.
+ * ../index.js and drives them against fake Cordis services. Covers the v2
+ * snapshot contract (projects/workspace resolution, active-first ordering,
+ * idle/ready counts, totals/projects aggregation), defensive `team/member` +
+ * `team/task` normalization, JSON safety, and the route's 200/404/500 behavior.
  */
 
 import test from 'node:test'
@@ -25,6 +26,9 @@ import {
 
 const ROOT_ID = 'session-root'
 const TEAMMATE_ID = 'session-reviewer'
+/** Fake Lead-session creation cwd; with no workspace registry this is the project fallback. */
+const ROOT_CWD = 'C:\\Users\\dev\\team'
+const DEFAULT_CONFIG = { provider: 'deepseek', model: 'deepseek-flash' }
 
 // ---------------------------------------------------------------------------
 // fakes
@@ -60,12 +64,17 @@ function createFakeContext(services = {}) {
   }
 }
 
-function makeSession(id, events, header) {
+/**
+ * Fake live Session. `header` is the config-bearing request header; the fourth
+ * argument is the immutable creation header read for `header.cwd` (v2).
+ */
+function makeSession(id, events, header, creationHeader) {
   const sorted = [...events].sort((a, b) => Number(a.seq) - Number(b.seq))
   const seq = sorted.reduce((max, event) => Math.max(max, Number(event.seq) + 1), 0)
   return {
     id,
     seq,
+    header: creationHeader,
     snapshotEvents(fromSeq, toSeqExclusive) {
       const from = Number.isFinite(Number(fromSeq)) ? Number(fromSeq) : 0
       const to = Number.isFinite(Number(toSeqExclusive)) ? Number(toSeqExclusive) : Number.POSITIVE_INFINITY
@@ -73,6 +82,19 @@ function makeSession(id, events, header) {
     },
     requestHeader() {
       return header
+    },
+  }
+}
+
+/** Workspace registry entity fake: `{ id, path, title, sessionIds }` (all synchronous). */
+function makeWorkspace(id, path, title, sessionIds = []) {
+  return { id, path, title, sessionIds: [...sessionIds] }
+}
+
+function createFakeWorkspaceRegistry(workspaces) {
+  return {
+    list() {
+      return workspaces
     },
   }
 }
@@ -85,11 +107,31 @@ function taskEvent(seq, time, task) {
   return { type: 'team/task', seq, time, data: { version: 2, teamId: ROOT_ID, task } }
 }
 
+/** TeamTaskView fake with two-state `ready` (the only field the contract inspects). */
+function taskView({ id, status = 'pending', ready = false, blockedBy = [], subject = id, ownerName = null } = {}) {
+  return {
+    id,
+    revision: 1,
+    subject,
+    description: `task ${id}`,
+    status,
+    ownerName,
+    blockedBy,
+    ready,
+    writeScopes: [],
+    writeScopeWarnings: [],
+  }
+}
+
 /**
- * One complete team: Lead + one teammate + 3 tasks (in-progress / blocked
- * pending / completed), with real version-2 team events in the Lead log.
+ * One complete team: Lead + one teammate + 4 tasks (in-progress / blocked
+ * pending / completed / ready pending), with real version-2 team events in the
+ * Lead log and a creation-header cwd (no workspace registry: cwd fallback).
+ * @param options.withSessions - mount the `sessions` service (default true).
+ * @param options.cwd - Lead session creation cwd; null/empty omits `header.cwd`.
+ * @param options.workspaces - when an array, mounts a fake `workspaceRegistry`.
  */
-function buildTeamServices({ withSessions = true } = {}) {
+function buildTeamServices({ withSessions = true, cwd = ROOT_CWD, workspaces = null } = {}) {
   const rootAgent = { id: ROOT_ID, status: 'running' }
   const teammateAgent = { id: TEAMMATE_ID, status: 'running' }
 
@@ -141,9 +183,10 @@ function buildTeamServices({ withSessions = true } = {}) {
     { type: 'tool/result', seq: 4, time: 1180, data: {} },
   ]
 
+  const leadCreationHeader = typeof cwd === 'string' && cwd.length > 0 ? { cwd } : undefined
   const sessions = {
     get(id) {
-      if (id === ROOT_ID) return makeSession(ROOT_ID, rootEvents, { config: { provider: 'deepseek', model: 'deepseek-flash' } })
+      if (id === ROOT_ID) return makeSession(ROOT_ID, rootEvents, { config: { provider: 'deepseek', model: 'deepseek-flash' } }, leadCreationHeader)
       if (id === TEAMMATE_ID) return makeSession(TEAMMATE_ID, reviewerEvents, { config: { provider: 'deepseek', model: 'deepseek-chat' } })
       return undefined
     },
@@ -192,6 +235,17 @@ function buildTeamServices({ withSessions = true } = {}) {
       writeScopes: [],
       writeScopeWarnings: [],
     },
+    {
+      id: 'task-4',
+      revision: 1,
+      subject: 'Ready pending task',
+      description: 'ready',
+      status: 'pending',
+      blockedBy: [],
+      ready: true,
+      writeScopes: [],
+      writeScopeWarnings: [],
+    },
   ]
 
   const agentTeams = {
@@ -200,12 +254,12 @@ function buildTeamServices({ withSessions = true } = {}) {
       if (agent.id === TEAMMATE_ID) return { root: rootAgent, id: ROOT_ID, role: 'teammate', name: 'reviewer' }
       return undefined
     },
-    listMembers(rootAgent) {
-      assert.equal(rootAgent.id, ROOT_ID)
+    listMembers(rootAgentValue) {
+      assert.equal(rootAgentValue.id, ROOT_ID)
       return members
     },
-    listTasks(rootAgent) {
-      assert.equal(rootAgent.id, ROOT_ID)
+    listTasks(rootAgentValue) {
+      assert.equal(rootAgentValue.id, ROOT_ID)
       return tasks
     },
   }
@@ -213,7 +267,117 @@ function buildTeamServices({ withSessions = true } = {}) {
   const agents = { list: () => [rootAgent, teammateAgent] }
   const services = { agents, agentTeams }
   if (withSessions) services.sessions = sessions
+  if (Array.isArray(workspaces)) services.workspaceRegistry = createFakeWorkspaceRegistry(workspaces)
   return { services, rootEvents, sessions, members, tasks }
+}
+
+/**
+ * Smaller team fixture for the focused v2 tests: Lead + teammate(s) + tasks,
+ * one task event to anchor `activityAt`, optional creation-header cwd and fake
+ * workspace registry. Reuses the same session/workspace fakes as above.
+ */
+function buildSimpleTeam({
+  teamId = ROOT_ID,
+  cwd = ROOT_CWD,
+  rootStatus = 'running',
+  memberStatus = 'running',
+  members,
+  tasks = [],
+  latestTime = 1000,
+  workspaces = null,
+  withSessions = true,
+} = {}) {
+  const rootAgent = { id: teamId, status: rootStatus }
+  const teammateViews =
+    Array.isArray(members) && members.length > 0
+      ? members
+      : [{ id: `${teamId}-helper`, name: 'helper', role: 'teammate', status: memberStatus, description: 'h', diagnostics: [] }]
+  const memberViews = [{ id: teamId, name: 'lead', role: 'lead', status: rootStatus, diagnostics: [] }, ...teammateViews]
+  const rootEvents = [
+    {
+      type: 'team/task',
+      seq: 1,
+      time: latestTime,
+      data: {
+        version: 2,
+        teamId,
+        task: { id: 'task-event', revision: 1, subject: 'event', status: 'pending', blockedBy: [], writeScopes: [] },
+      },
+    },
+  ]
+  const creationHeader = typeof cwd === 'string' && cwd.length > 0 ? { cwd } : undefined
+  const services = {
+    agents: { list: () => [rootAgent] },
+    agentTeams: {
+      tryMembership(agent) {
+        if (agent.id === teamId) return { root: rootAgent, id: teamId, role: 'lead', name: 'lead' }
+        return undefined
+      },
+      listMembers(rootAgentValue) {
+        assert.equal(rootAgentValue.id, teamId)
+        return memberViews
+      },
+      listTasks(rootAgentValue) {
+        assert.equal(rootAgentValue.id, teamId)
+        return tasks
+      },
+    },
+  }
+  if (withSessions) {
+    services.sessions = {
+      get(id) {
+        return id === teamId ? makeSession(teamId, rootEvents, { config: DEFAULT_CONFIG }, creationHeader) : undefined
+      },
+    }
+  }
+  if (Array.isArray(workspaces)) services.workspaceRegistry = createFakeWorkspaceRegistry(workspaces)
+  return { services, rootAgent, teamId, memberViews, tasks }
+}
+
+/** Merge several single-team fixtures into one fake service set (multi-team snapshots). */
+function combineTeamServices(...fixtures) {
+  const fixtureFor = (teamId) => fixtures.find((fixture) => fixture.teamId === teamId)
+  const services = {
+    agents: { list: () => fixtures.flatMap((fixture) => fixture.services.agents.list()) },
+    agentTeams: {
+      tryMembership(agent) {
+        for (const fixture of fixtures) {
+          const membership = fixture.services.agentTeams.tryMembership(agent)
+          if (membership) return membership
+        }
+        return undefined
+      },
+      listMembers(rootAgent) {
+        return fixtureFor(rootAgent.id).services.agentTeams.listMembers(rootAgent)
+      },
+      listTasks(rootAgent) {
+        return fixtureFor(rootAgent.id).services.agentTeams.listTasks(rootAgent)
+      },
+    },
+  }
+  const sessionOwners = fixtures.filter((fixture) => fixture.services.sessions)
+  if (sessionOwners.length > 0) {
+    services.sessions = {
+      get(id) {
+        for (const fixture of sessionOwners) {
+          const session = fixture.services.sessions.get(id)
+          if (session) return session
+        }
+        return undefined
+      },
+    }
+  }
+  const registryOwners = fixtures.filter((fixture) => fixture.services.workspaceRegistry)
+  if (registryOwners.length > 0) {
+    services.workspaceRegistry = {
+      list() {
+        const workspaces = []
+        for (const fixture of registryOwners) workspaces.push(...fixture.services.workspaceRegistry.list())
+        return workspaces
+      },
+    }
+  }
+  return services
 }
 
 /** JSON losslessness: stringify/parse must round-trip and contain no undefined. */
@@ -230,7 +394,7 @@ function assertLossless(value) {
 
 test('module exports inject=[webServer] and pure helpers', () => {
   assert.deepEqual(inject, ['webServer'])
-  assert.equal(VERSION, 1)
+  assert.equal(VERSION, 2)
   assert.equal(typeof apply, 'function')
   assert.equal(typeof collectTeams, 'function')
   assert.equal(typeof createSnapshot, 'function')
@@ -250,14 +414,17 @@ test('index.js has no import statements (dependency-free ESM)', () => {
 // unsupported / empty
 // ---------------------------------------------------------------------------
 
-test('unsupported: no services yields ok:true + unsupported string + empty teams', () => {
+const EMPTY_TOTALS = { teams: 0, activeTeams: 0, members: 0, running: 0, tasks: 0, pending: 0, inProgress: 0, blocked: 0, completed: 0 }
+
+test('unsupported: no services yields ok:true + unsupported string + empty teams/projects', () => {
   const snapshot = createSnapshot(createFakeContext())
-  assert.equal(snapshot.version, 1)
+  assert.equal(snapshot.version, 2)
   assert.equal(snapshot.ok, true)
   assert.equal(typeof snapshot.unsupported, 'string')
   assert.ok(snapshot.unsupported.length > 0)
   assert.deepEqual(snapshot.teams, [])
-  assert.deepEqual(snapshot.totals, { teams: 0, members: 0, running: 0, tasks: 0, completed: 0 })
+  assert.deepEqual(snapshot.projects, [])
+  assert.deepEqual(snapshot.totals, EMPTY_TOTALS)
   assert.equal(typeof snapshot.generatedAt, 'number')
   assertLossless(snapshot)
 })
@@ -271,6 +438,7 @@ test('unsupported: agentTeams without agents is still reported as unsupported', 
   assert.equal(snapshot.ok, true)
   assert.equal(typeof snapshot.unsupported, 'string')
   assert.deepEqual(snapshot.teams, [])
+  assert.deepEqual(snapshot.projects, [])
 })
 
 test('empty: implicit one-person Lead with no tasks is filtered out', () => {
@@ -286,7 +454,8 @@ test('empty: implicit one-person Lead with no tasks is filtered out', () => {
   const snapshot = createSnapshot(createFakeContext(services))
   assert.equal(snapshot.unsupported, null)
   assert.deepEqual(snapshot.teams, [])
-  assert.deepEqual(snapshot.totals, { teams: 0, members: 0, running: 0, tasks: 0, completed: 0 })
+  assert.deepEqual(snapshot.projects, [])
+  assert.deepEqual(snapshot.totals, EMPTY_TOTALS)
   assertLossless(snapshot)
 })
 
@@ -294,11 +463,11 @@ test('empty: implicit one-person Lead with no tasks is filtered out', () => {
 // full team
 // ---------------------------------------------------------------------------
 
-test('one team: members, enrichment, counts, tasks, and activity timeline', () => {
+test('one team: members, project fallback, enrichment, counts, tasks, and activity timeline', () => {
   const { services } = buildTeamServices()
   const snapshot = createSnapshot(createFakeContext(services))
 
-  assert.equal(snapshot.version, 1)
+  assert.equal(snapshot.version, 2)
   assert.equal(snapshot.ok, true)
   assert.equal(snapshot.unsupported, null)
   assert.equal(snapshot.teams.length, 1)
@@ -306,21 +475,27 @@ test('one team: members, enrichment, counts, tasks, and activity timeline', () =
   const team = snapshot.teams[0]
   assert.equal(team.id, ROOT_ID)
   assert.equal(team.error, null)
+  assert.equal(team.active, true)
 
-  // counts: 2 members (running), 3 tasks (1 pending/blocked, 1 in_progress, 1 completed)
+  // project: no workspace registry -> synthetic project from the Lead session header.cwd
+  assert.deepEqual(team.project, { id: `cwd:${ROOT_CWD}`, title: 'team', path: ROOT_CWD })
+
+  // counts: 2 members (running), 4 tasks (1 in_progress, 1 blocked pending, 1 completed, 1 ready pending)
   assert.deepEqual(team.counts, {
     members: 2,
     running: 2,
     provisioning: 0,
     failed: 0,
-    tasks: 3,
-    pending: 1,
+    idle: 0,
+    tasks: 4,
+    pending: 2,
     inProgress: 1,
     completed: 1,
     blocked: 1,
+    ready: 1,
   })
 
-  // roster: lead first, creation order preserved
+  // roster: lead first, creation order preserved; both members currently active
   assert.equal(team.members.length, 2)
   assert.deepEqual(
     team.members.map((member) => member.role),
@@ -329,6 +504,10 @@ test('one team: members, enrichment, counts, tasks, and activity timeline', () =
   assert.deepEqual(
     team.members.map((member) => member.name),
     ['lead', 'reviewer'],
+  )
+  assert.deepEqual(
+    team.members.map((member) => member.active),
+    [true, true],
   )
 
   const lead = team.members[0]
@@ -350,15 +529,20 @@ test('one team: members, enrichment, counts, tasks, and activity timeline', () =
   assert.equal(reviewer.turns, 3)
   assert.equal(reviewer.steps, 9)
 
-  // tasks: numeric creation order, description capped at 2000
+  // tasks: numeric creation order, description capped at 2000, active only in progress
   assert.deepEqual(
     team.tasks.map((task) => task.id),
-    ['task-1', 'task-2', 'task-3'],
+    ['task-1', 'task-2', 'task-3', 'task-4'],
+  )
+  assert.deepEqual(
+    team.tasks.map((task) => task.active),
+    [true, false, false, false],
   )
   assert.equal(team.tasks[0].description.length, 2000)
   assert.deepEqual(team.tasks[1].blockedBy, ['task-1'])
   assert.equal(team.tasks[1].ready, false)
   assert.equal(team.tasks[2].ownerName, 'lead')
+  assert.equal(team.tasks[3].ready, true)
 
   // activity: newest first, only team/member + team/task
   assert.deepEqual(
@@ -385,7 +569,29 @@ test('one team: members, enrichment, counts, tasks, and activity timeline', () =
   assert.equal(team.activity[1].taskId, 'task-1')
   assert.equal(team.activity[2].subject, 'Review the diff')
 
-  assert.deepEqual(snapshot.totals, { teams: 1, members: 2, running: 2, tasks: 3, completed: 1 })
+  // totals + projects: one active team owning one cwd project
+  assert.deepEqual(snapshot.totals, {
+    teams: 1,
+    activeTeams: 1,
+    members: 2,
+    running: 2,
+    tasks: 4,
+    pending: 2,
+    inProgress: 1,
+    blocked: 1,
+    completed: 1,
+  })
+  assert.deepEqual(snapshot.projects, [
+    {
+      id: `cwd:${ROOT_CWD}`,
+      title: 'team',
+      path: ROOT_CWD,
+      teams: 1,
+      activeTeams: 1,
+      running: 2,
+      inProgress: 1,
+    },
+  ])
   assertLossless(snapshot)
 })
 
@@ -394,98 +600,18 @@ test('collectTeams returns the same team objects sorted by recent activity', () 
   const teams = collectTeams(createFakeContext(services))
   assert.equal(teams.length, 1)
   assert.equal(teams[0].id, ROOT_ID)
+  assert.deepEqual(teams[0].project, { id: `cwd:${ROOT_CWD}`, title: 'team', path: ROOT_CWD })
 })
 
-test('teams are ordered by most recent activity (desc)', () => {
-  const makeTeam = (rootId, memberId, latestTime) => {
-    const rootAgent = { id: rootId, status: 'running' }
-    const memberAgent = { id: memberId, status: 'inactive' }
-    const rootSession = makeSession(
-      rootId,
-      [
-        {
-          type: 'team/task',
-          seq: 1,
-          time: latestTime,
-          data: {
-            version: 2,
-            teamId: rootId,
-            task: { id: 'task-1', revision: 1, subject: 's', status: 'pending', blockedBy: [], writeScopes: [] },
-          },
-        },
-      ],
-      undefined,
-    )
-    return {
-      rootAgent,
-      memberAgent,
-      services: {
-        agents: { list: () => [rootAgent, memberAgent] },
-        agentTeams: {
-          tryMembership(agent) {
-            if (agent.id === rootId) return { root: rootAgent, id: rootId, role: 'lead', name: 'lead' }
-            if (agent.id === memberId) return { root: rootAgent, id: rootId, role: 'teammate', name: 'helper' }
-            return undefined
-          },
-          listMembers: () => [
-            { id: rootId, name: 'lead', role: 'lead', status: 'running', diagnostics: [] },
-            { id: memberId, name: 'helper', role: 'teammate', status: 'inactive', description: 'h', diagnostics: [] },
-          ],
-          listTasks: () => [
-            {
-              id: 'task-1',
-              revision: 1,
-              subject: 's',
-              description: 'd',
-              status: 'pending',
-              blockedBy: [],
-              ready: true,
-              writeScopes: [],
-              writeScopeWarnings: [],
-            },
-          ],
-        },
-        sessions: { get: (id) => (id === rootId ? rootSession : undefined) },
-      },
-    }
-  }
-
-  const fresh = makeTeam('session-new', 'session-new-teammate', 9000)
-  const old = makeTeam('session-old', 'session-old-teammate', 500)
-  const combined = {
-    agents: { list: () => [fresh.rootAgent, fresh.memberAgent, old.rootAgent, old.memberAgent] },
-    agentTeams: {
-      tryMembership(agent) {
-        return fresh.services.agentTeams.tryMembership(agent) ?? old.services.agentTeams.tryMembership(agent)
-      },
-      listMembers(rootAgent) {
-        return (rootAgent.id === 'session-new' ? fresh : old).services.agentTeams.listMembers()
-      },
-      listTasks(rootAgent) {
-        return (rootAgent.id === 'session-new' ? fresh : old).services.agentTeams.listTasks()
-      },
-    },
-    sessions: { get: (id) => fresh.services.sessions.get(id) ?? old.services.sessions.get(id) },
-  }
-
-  const snapshot = createSnapshot(createFakeContext(combined))
-  assert.deepEqual(
-    snapshot.teams.map((team) => team.id),
-    ['session-new', 'session-old'],
-  )
-  assert.equal(snapshot.teams[0].activity.length, 1)
-  assert.equal(snapshot.teams[0].activity[0].time, 9000)
-  assert.equal(snapshot.teams[1].activity[0].time, 500)
-  assertLossless(snapshot)
-})
-
-test('missing sessions service degrades enrichment/activity without failing', () => {
+test('missing sessions service degrades enrichment/activity and leaves project null', () => {
   const { services } = buildTeamServices({ withSessions: false })
   const snapshot = createSnapshot(createFakeContext(services))
   assert.equal(snapshot.ok, true)
   assert.equal(snapshot.unsupported, null)
   assert.equal(snapshot.teams.length, 1)
   const team = snapshot.teams[0]
+  assert.equal(team.project, null)
+  assert.deepEqual(snapshot.projects, [])
   assert.deepEqual(team.activity, [])
   for (const member of team.members) {
     assert.equal(member.lastActivityAt, null)
@@ -493,6 +619,391 @@ test('missing sessions service degrades enrichment/activity without failing', ()
     assert.equal(member.turns, null)
     assert.equal(member.steps, null)
   }
+  assertLossless(snapshot)
+})
+
+// ---------------------------------------------------------------------------
+// ordering
+// ---------------------------------------------------------------------------
+
+test('teams with equal active state are ordered by most recent activity (desc)', () => {
+  const fresh = buildSimpleTeam({ teamId: 'session-new', latestTime: 9000 })
+  const old = buildSimpleTeam({ teamId: 'session-old', latestTime: 500 })
+  const snapshot = createSnapshot(createFakeContext(combineTeamServices(fresh, old)))
+  assert.deepEqual(
+    snapshot.teams.map((team) => team.id),
+    ['session-new', 'session-old'],
+  )
+  assert.equal(snapshot.teams[0].activity[0].time, 9000)
+  assert.equal(snapshot.teams[1].activity[0].time, 500)
+  assertLossless(snapshot)
+})
+
+test('active teams are ordered before idle teams even when the idle team is more recent', () => {
+  const activeOld = buildSimpleTeam({ teamId: 'session-active-old', latestTime: 500 })
+  const activeRecent = buildSimpleTeam({ teamId: 'session-active-recent', latestTime: 3000 })
+  const idleRecent = buildSimpleTeam({ teamId: 'session-idle-recent', rootStatus: 'inactive', memberStatus: 'inactive', latestTime: 9000 })
+  const snapshot = createSnapshot(createFakeContext(combineTeamServices(activeOld, activeRecent, idleRecent)))
+
+  assert.deepEqual(
+    snapshot.teams.map((team) => team.id),
+    ['session-active-recent', 'session-active-old', 'session-idle-recent'],
+  )
+  assert.deepEqual(
+    snapshot.teams.map((team) => team.active),
+    [true, true, false],
+  )
+  assert.equal(snapshot.totals.activeTeams, 2)
+  assertLossless(snapshot)
+})
+
+// ---------------------------------------------------------------------------
+// project / workspace resolution
+// ---------------------------------------------------------------------------
+
+test('project: workspaceRegistry entity wins by lead sessionIds and beats a cwd path match', () => {
+  const { services } = buildTeamServices({
+    workspaces: [
+      // Listed first and path-matches the cwd, but does not own the Lead session.
+      makeWorkspace('workspace-path', ROOT_CWD, 'path-match', []),
+      makeWorkspace('workspace-owner', 'D:\\repos\\team', 'team-owner', [ROOT_ID]),
+    ],
+  })
+  const snapshot = createSnapshot(createFakeContext(services))
+  assert.deepEqual(snapshot.teams[0].project, { id: 'workspace-owner', title: 'team-owner', path: 'D:\\repos\\team' })
+  assert.deepEqual(snapshot.projects, [
+    {
+      id: 'workspace-owner',
+      title: 'team-owner',
+      path: 'D:\\repos\\team',
+      teams: 1,
+      activeTeams: 1,
+      running: 2,
+      inProgress: 1,
+    },
+  ])
+
+  // The sessionIds match works even without a sessions service (no cwd needed).
+  const withoutSessions = buildTeamServices({
+    withSessions: false,
+    workspaces: [makeWorkspace('workspace-owner', 'D:\\repos\\team', 'team-owner', [ROOT_ID])],
+  })
+  const fallbackSnapshot = createSnapshot(createFakeContext(withoutSessions.services))
+  assert.deepEqual(fallbackSnapshot.teams[0].project, { id: 'workspace-owner', title: 'team-owner', path: 'D:\\repos\\team' })
+  assertLossless(snapshot)
+})
+
+test('project: workspace path matches the Lead cwd case-insensitively across separators', () => {
+  const cases = [
+    {
+      cwd: 'c:\\users\\dev\\team',
+      workspace: makeWorkspace('workspace-backslash', 'C:\\Users\\DEV\\Team', 'repo', []),
+      expected: { id: 'workspace-backslash', title: 'repo', path: 'C:\\Users\\DEV\\Team' },
+    },
+    {
+      cwd: 'C:/Users/dev/TEAM',
+      workspace: makeWorkspace('workspace-mixed', 'C:\\Users\\Dev\\team\\', 'repo-mixed', []),
+      expected: { id: 'workspace-mixed', title: 'repo-mixed', path: 'C:\\Users\\Dev\\team\\' },
+    },
+  ]
+  for (const item of cases) {
+    const { services } = buildTeamServices({ cwd: item.cwd, workspaces: [item.workspace] })
+    const snapshot = createSnapshot(createFakeContext(services))
+    assert.deepEqual(snapshot.teams[0].project, item.expected)
+    assertLossless(snapshot)
+  }
+})
+
+test('project: workspace-derived title falls back to the path basename when blank', () => {
+  const cases = [
+    {
+      label: 'missing title (sessionIds match)',
+      workspace: { id: 'workspace-no-title', path: 'C:\\repos\\alpha', sessionIds: [ROOT_ID] },
+      expected: { id: 'workspace-no-title', title: 'alpha', path: 'C:\\repos\\alpha' },
+    },
+    {
+      label: 'empty title (sessionIds match)',
+      workspace: { id: 'workspace-empty-title', path: 'D:/repos/beta/', title: '', sessionIds: [ROOT_ID] },
+      expected: { id: 'workspace-empty-title', title: 'beta', path: 'D:/repos/beta/' },
+    },
+    {
+      label: 'whitespace title (sessionIds match)',
+      workspace: { id: 'workspace-blank-title', path: 'C:\\repos\\gamma', title: '   ', sessionIds: [ROOT_ID] },
+      expected: { id: 'workspace-blank-title', title: 'gamma', path: 'C:\\repos\\gamma' },
+    },
+    {
+      label: 'drive-root path',
+      workspace: { id: 'workspace-root', path: 'C:\\', sessionIds: [ROOT_ID] },
+      expected: { id: 'workspace-root', title: 'C:\\', path: 'C:\\' },
+    },
+    {
+      label: 'path/cwd match branch',
+      workspace: { id: 'workspace-path-titleless', path: 'c:/users/dev/team', title: '  ' },
+      expected: { id: 'workspace-path-titleless', title: 'team', path: 'c:/users/dev/team' },
+    },
+  ]
+  for (const item of cases) {
+    const { services } = buildTeamServices({ workspaces: [item.workspace] })
+    const snapshot = createSnapshot(createFakeContext(services))
+    assert.deepEqual(snapshot.teams[0].project, item.expected, item.label)
+    assert.equal(snapshot.projects.length, 1, item.label)
+    assert.equal(snapshot.projects[0].id, item.expected.id, item.label)
+    assert.equal(snapshot.projects[0].title, item.expected.title, item.label)
+    assert.equal(typeof snapshot.projects[0].title, 'string', item.label)
+    assert.ok(snapshot.projects[0].title.trim().length > 0, item.label)
+    assertLossless(snapshot)
+  }
+
+  // A usable title is trimmed; when the title and the path are both unusable
+  // the project id keeps the label non-empty.
+  const trimmed = createSnapshot(
+    createFakeContext(
+      buildTeamServices({
+        workspaces: [{ id: 'workspace-trimmed', title: '  Team Alpha  ', path: 'C:\\repos\\alpha', sessionIds: [ROOT_ID] }],
+      }).services,
+    ),
+  )
+  assert.deepEqual(trimmed.teams[0].project, { id: 'workspace-trimmed', title: 'Team Alpha', path: 'C:\\repos\\alpha' })
+
+  const idOnly = createSnapshot(
+    createFakeContext(buildTeamServices({ workspaces: [{ id: 'workspace-id-only', title: ' \t ', sessionIds: [ROOT_ID] }] }).services),
+  )
+  assert.deepEqual(idOnly.teams[0].project, { id: 'workspace-id-only', title: 'workspace-id-only', path: null })
+  assertLossless(trimmed)
+  assertLossless(idOnly)
+})
+
+test('project: cwd fallback handles Windows separators, trailing separators and drive roots', () => {
+  const cases = [
+    { cwd: ROOT_CWD, title: 'team' },
+    { cwd: 'C:\\Users\\dev\\team\\', title: 'team' },
+    { cwd: 'D:/work/proj', title: 'proj' },
+    { cwd: 'C:\\', title: 'C:\\' },
+    { cwd: 'C:/', title: 'C:/' },
+  ]
+  for (const item of cases) {
+    const { services } = buildTeamServices({ cwd: item.cwd })
+    const snapshot = createSnapshot(createFakeContext(services))
+    assert.deepEqual(snapshot.teams[0].project, { id: `cwd:${item.cwd}`, title: item.title, path: item.cwd })
+    assert.equal(snapshot.projects.length, 1)
+    assert.equal(snapshot.projects[0].id, `cwd:${item.cwd}`)
+    assertLossless(snapshot)
+  }
+})
+
+test('project: null without workspace/cwd; those teams are never grouped into a project', () => {
+  const noSessions = createSnapshot(createFakeContext(buildTeamServices({ withSessions: false }).services))
+  assert.equal(noSessions.teams.length, 1)
+  assert.equal(noSessions.teams[0].project, null)
+  assert.deepEqual(noSessions.projects, [])
+  assert.equal(noSessions.totals.teams, 1)
+
+  const noCwd = createSnapshot(createFakeContext(buildTeamServices({ cwd: null }).services))
+  assert.equal(noCwd.teams.length, 1)
+  assert.equal(noCwd.teams[0].project, null)
+  assert.deepEqual(noCwd.projects, [])
+  assert.ok(noCwd.teams[0].activity.length > 0) // sessions still work for enrichment
+
+  const unmatched = createSnapshot(
+    createFakeContext(
+      buildTeamServices({ cwd: null, workspaces: [makeWorkspace('workspace-other', 'D:\\elsewhere', 'other', ['session-other'])] }).services,
+    ),
+  )
+  assert.equal(unmatched.teams[0].project, null)
+  assert.deepEqual(unmatched.projects, [])
+
+  // Mixed snapshot: the project-less team is still listed and counted, but the
+  // virtual null-project group never appears in `projects`.
+  const mixed = createSnapshot(
+    createFakeContext(
+      combineTeamServices(
+        buildSimpleTeam({ teamId: 'session-with-cwd' }),
+        buildSimpleTeam({ teamId: 'session-without-cwd', cwd: null, withSessions: false }),
+      ),
+    ),
+  )
+  assert.equal(mixed.teams.length, 2)
+  assert.equal(mixed.totals.teams, 2)
+  assert.equal(mixed.teams.filter((team) => team.project === null).length, 1)
+  assert.deepEqual(
+    mixed.projects.map((project) => project.teams),
+    [1],
+  )
+  assertLossless(noSessions)
+  assertLossless(noCwd)
+  assertLossless(unmatched)
+  assertLossless(mixed)
+})
+
+test('project: throwing/odd workspaceRegistry never throws; malformed entities are skipped', () => {
+  const thrown = buildTeamServices()
+  thrown.services.workspaceRegistry = {
+    list() {
+      throw new Error('registry broke')
+    },
+  }
+  const thrownSnapshot = createSnapshot(createFakeContext(thrown.services))
+  assert.deepEqual(thrownSnapshot.teams[0].project, { id: `cwd:${ROOT_CWD}`, title: 'team', path: ROOT_CWD })
+
+  const nonArray = buildTeamServices()
+  nonArray.services.workspaceRegistry = { list: () => null }
+  const nonArraySnapshot = createSnapshot(createFakeContext(nonArray.services))
+  assert.deepEqual(nonArraySnapshot.teams[0].project, { id: `cwd:${ROOT_CWD}`, title: 'team', path: ROOT_CWD })
+
+  const throwingSessionIds = { id: 'workspace-throws', path: 'C:\\elsewhere', title: 'broken' }
+  Object.defineProperty(throwingSessionIds, 'sessionIds', {
+    get() {
+      throw new Error('sessionIds broke')
+    },
+  })
+  const guarded = buildTeamServices({
+    workspaces: [null, { id: '', path: 'C:\\nope', title: 'no-id' }, throwingSessionIds, makeWorkspace('workspace-ok', ROOT_CWD, 'ok', [])],
+  })
+  const guardedSnapshot = createSnapshot(createFakeContext(guarded.services))
+  assert.deepEqual(guardedSnapshot.teams[0].project, { id: 'workspace-ok', title: 'ok', path: ROOT_CWD })
+  assertLossless(thrownSnapshot)
+  assertLossless(guardedSnapshot)
+})
+
+// ---------------------------------------------------------------------------
+// counts, active flags, totals and projects aggregation
+// ---------------------------------------------------------------------------
+
+test('counts idle/ready plus member and task active flags', () => {
+  const members = [
+    { id: 'session-idle', name: 'idle', role: 'teammate', status: 'inactive', description: 'i', diagnostics: [] },
+    { id: 'session-prov', name: 'prov', role: 'teammate', status: 'provisioning', description: 'p', diagnostics: [] },
+    { id: 'session-failed', name: 'failed', role: 'teammate', status: 'failed', description: 'f', diagnostics: [] },
+  ]
+  const tasks = [
+    taskView({ id: 'task-ready', status: 'pending', ready: true }),
+    taskView({ id: 'task-blocked', status: 'pending', ready: false, blockedBy: ['task-ready'] }),
+    taskView({ id: 'task-pending', status: 'pending', ready: false }),
+    taskView({ id: 'task-active', status: 'in_progress', ownerName: 'helper' }),
+    taskView({ id: 'task-completed', status: 'completed' }),
+  ]
+  const fixture = buildSimpleTeam({ members, tasks })
+  const snapshot = createSnapshot(createFakeContext(fixture.services))
+  const team = snapshot.teams[0]
+
+  assert.deepEqual(team.counts, {
+    members: 4,
+    running: 1,
+    provisioning: 1,
+    failed: 1,
+    idle: 1,
+    tasks: 5,
+    pending: 3,
+    inProgress: 1,
+    completed: 1,
+    blocked: 1,
+    ready: 1,
+  })
+  assert.equal(team.active, true)
+
+  // Lead (running) is active; inactive/failed are not, provisioning is.
+  assert.deepEqual(
+    team.members.map((member) => member.name),
+    ['lead', 'idle', 'prov', 'failed'],
+  )
+  assert.deepEqual(
+    team.members.map((member) => member.active),
+    [true, false, true, false],
+  )
+  assert.deepEqual(
+    team.tasks.map((task) => task.active),
+    [false, false, false, true, false],
+  )
+
+  assert.deepEqual(snapshot.totals, {
+    teams: 1,
+    activeTeams: 1,
+    members: 4,
+    running: 1,
+    tasks: 5,
+    pending: 3,
+    inProgress: 1,
+    blocked: 1,
+    completed: 1,
+  })
+  assert.deepEqual(snapshot.projects, [
+    { id: `cwd:${ROOT_CWD}`, title: 'team', path: ROOT_CWD, teams: 1, activeTeams: 1, running: 1, inProgress: 1 },
+  ])
+  assertLossless(snapshot)
+})
+
+test('projects aggregate listed teams only, with activeTeams/teams/title ordering', () => {
+  const alphaRun = buildSimpleTeam({
+    teamId: 'session-alpha-run',
+    cwd: 'C:\\repo\\alpha',
+    latestTime: 500,
+    tasks: [taskView({ id: 'task-alpha', status: 'in_progress' })],
+  })
+  const alphaIdle = buildSimpleTeam({
+    teamId: 'session-alpha-idle',
+    cwd: 'C:\\repo\\alpha',
+    rootStatus: 'inactive',
+    memberStatus: 'inactive',
+    latestTime: 9000,
+  })
+  const betaRun = buildSimpleTeam({ teamId: 'session-beta-run', cwd: 'C:\\repo\\beta', latestTime: 2000 })
+  const gammaRun = buildSimpleTeam({ teamId: 'session-gamma-run', cwd: 'C:\\repo\\gamma', latestTime: 3000 })
+  const deltaIdle = buildSimpleTeam({
+    teamId: 'session-delta-idle',
+    cwd: 'C:\\repo\\delta',
+    rootStatus: 'inactive',
+    memberStatus: 'inactive',
+    latestTime: 4000,
+  })
+  const services = combineTeamServices(alphaRun, alphaIdle, betaRun, gammaRun, deltaIdle)
+
+  // The optional registry must be listed at most once per snapshot, not per team.
+  let listCalls = 0
+  services.workspaceRegistry = {
+    list() {
+      listCalls += 1
+      return []
+    },
+  }
+
+  const snapshot = createSnapshot(createFakeContext(services))
+  assert.equal(listCalls, 1)
+
+  // Teams: active first (activity desc), then idle (activity desc).
+  assert.deepEqual(
+    snapshot.teams.map((team) => team.id),
+    ['session-gamma-run', 'session-beta-run', 'session-alpha-run', 'session-alpha-idle', 'session-delta-idle'],
+  )
+  assert.deepEqual(
+    snapshot.teams.map((team) => team.project === null ? null : team.project.id),
+    [
+      'cwd:C:\\repo\\gamma',
+      'cwd:C:\\repo\\beta',
+      'cwd:C:\\repo\\alpha',
+      'cwd:C:\\repo\\alpha',
+      'cwd:C:\\repo\\delta',
+    ],
+  )
+
+  // Projects: activeTeams desc, teams desc, then title asc.
+  assert.deepEqual(snapshot.projects, [
+    { id: 'cwd:C:\\repo\\alpha', title: 'alpha', path: 'C:\\repo\\alpha', teams: 2, activeTeams: 1, running: 2, inProgress: 1 },
+    { id: 'cwd:C:\\repo\\beta', title: 'beta', path: 'C:\\repo\\beta', teams: 1, activeTeams: 1, running: 2, inProgress: 0 },
+    { id: 'cwd:C:\\repo\\gamma', title: 'gamma', path: 'C:\\repo\\gamma', teams: 1, activeTeams: 1, running: 2, inProgress: 0 },
+    { id: 'cwd:C:\\repo\\delta', title: 'delta', path: 'C:\\repo\\delta', teams: 1, activeTeams: 0, running: 0, inProgress: 0 },
+  ])
+
+  assert.deepEqual(snapshot.totals, {
+    teams: 5,
+    activeTeams: 3,
+    members: 10,
+    running: 6,
+    tasks: 1,
+    pending: 0,
+    inProgress: 1,
+    blocked: 0,
+    completed: 0,
+  })
   assertLossless(snapshot)
 })
 
@@ -615,7 +1126,8 @@ test('normalizeActivity caps the timeline at 40 entries, newest first', () => {
   assert.equal(entries[39].seq, 60)
 })
 
-test('task release/reopen actions are derived from the previous in-window status', () => {  const entries = normalizeActivity(
+test('task release/reopen actions are derived from the previous in-window status', () => {
+  const entries = normalizeActivity(
     [
       { type: 'team/task', seq: 1, time: 1, data: { version: 2, task: { id: 'task-1', revision: 1, status: 'pending' } } },
       { type: 'team/task', seq: 2, time: 2, data: { version: 2, task: { id: 'task-1', revision: 2, status: 'in_progress', ownerId: 'lead' } } },
@@ -695,20 +1207,26 @@ test('snapshot stays lossless even when roster/task rows contain undefined and j
   const snapshot = createSnapshot(createFakeContext(services))
   assert.equal(snapshot.ok, true)
   assert.equal(snapshot.teams.length, 1)
+  assert.equal(snapshot.teams[0].project, null) // session has no creation-header cwd
+  assert.deepEqual(snapshot.projects, [])
   assertLossless(snapshot)
 
   const member = snapshot.teams[0].members[0]
   assert.equal(member.name, 'lead')
   assert.equal(member.status, 'inactive')
+  assert.equal(member.active, false)
   assert.deepEqual(member.diagnostics, ['diag'])
   const teammate = snapshot.teams[0].members[1]
   assert.equal(teammate.name, 'helper')
   assert.equal(teammate.context, null)
+  assert.equal(teammate.status, 'failed')
+  assert.equal(teammate.active, false)
   const task = snapshot.teams[0].tasks[0]
   assert.equal(task.id, 'task-1')
   assert.equal(task.revision, 0)
   assert.equal(task.subject, '')
   assert.equal(task.status, 'pending')
+  assert.equal(task.active, false)
   assert.deepEqual(task.blockedBy, ['task-0'])
 })
 
@@ -716,7 +1234,7 @@ test('snapshot stays lossless even when roster/task rows contain undefined and j
 // HTTP route
 // ---------------------------------------------------------------------------
 
-test('route: GET snapshot -> 200 JSON with cache headers; other requests -> 404', async () => {
+test('route: GET snapshot -> 200 JSON v2 with cache headers; other requests -> 404', async () => {
   const { services } = buildTeamServices()
   const handler = createRouteHandler(createFakeContext(services))
 
@@ -727,14 +1245,17 @@ test('route: GET snapshot -> 200 JSON with cache headers; other requests -> 404'
   assert.equal(okResponse.headers['cache-control'], 'no-store')
   const body = JSON.parse(okResponse.body)
   assert.equal(body.ok, true)
-  assert.equal(body.version, 1)
+  assert.equal(body.version, 2)
   assert.equal(body.teams.length, 1)
+  assert.equal(body.projects.length, 1)
+  assert.equal(body.totals.activeTeams, 1)
   assertLossless(body)
 
   const notFoundResponse = createFakeResponse()
   await handler({ method: 'POST', url: '/api/team-console/snapshot' }, notFoundResponse)
   assert.equal(notFoundResponse.statusCode, 404)
   assert.equal(JSON.parse(notFoundResponse.body).ok, false)
+  assert.equal(JSON.parse(notFoundResponse.body).version, 2)
 
   const wrongPathResponse = createFakeResponse()
   await handler({ method: 'GET', url: '/api/team-console/other' }, wrongPathResponse)
@@ -760,7 +1281,7 @@ test('route: aggregation failure -> 500 valid JSON, handler never rejects', asyn
   await assert.doesNotReject(() => handler({ method: 'GET', url: '/api/team-console/snapshot' }, response))
   assert.equal(response.statusCode, 500)
   const body = JSON.parse(response.body)
-  assert.equal(body.version, 1)
+  assert.equal(body.version, 2)
   assert.equal(body.ok, false)
   assert.equal(body.error, 'boom')
   assert.deepEqual(body.teams, [])
@@ -797,7 +1318,7 @@ test('route: DSH connection admission is enforced when the connection service is
   assert.equal(anonymousResponse.headers['content-type'], 'application/json; charset=utf-8')
   assert.equal(anonymousResponse.headers['cache-control'], 'no-store')
   const anonymousBody = JSON.parse(anonymousResponse.body)
-  assert.equal(anonymousBody.version, 1)
+  assert.equal(anonymousBody.version, 2)
   assert.equal(anonymousBody.ok, false)
   assert.equal(anonymousBody.error, 'unauthorized')
   assert.deepEqual(anonymousBody.teams, [])

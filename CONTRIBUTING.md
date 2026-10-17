@@ -65,10 +65,10 @@ node scripts/ci-guard.mjs
 `npm run check` runs the first three checks. The same commands run in CI on Node 22 and Node 24, so
 run them locally on the same major version you target.
 
-`node scripts/ci-guard.mjs` validates the cross-file DSH wiring: manifest fields, the exact
+`node scripts/ci-guard.mjs` runs 32 checks over the cross-file DSH wiring: manifest fields, the exact
 `engines.dsh` range, bundle patch references, exported client entry, the client bundle's
-self-registration id, and locale metadata. Keep those invariants intact when renaming files or
-changing exports.
+self-registration id, locale metadata, and the embedded client dictionary key parity. Keep those
+invariants intact when renaming files, changing exports, or editing UI copy.
 
 To test a change in a live app, install the package into a DSH profile using an absolute local path
 as the install spec, restart the app so the host half reloads, then open the panel. Host log lines
@@ -78,7 +78,7 @@ are prefixed `[agent-team-console]`. To probe the snapshot route of a running se
 TEAM_CONSOLE_URL=http://127.0.0.1:10100 node scripts/verify-live.mjs
 ```
 
-It exits `0` when the v1 contract matches, `1` on an unreachable route or contract violation, and `2`
+It exits `0` when the v2 contract matches, `1` on an unreachable route or contract violation, and `2`
 when admission rejects the request as unauthenticated. A `2` is expected against a running DSH
 desktop app: the route enforces DSH connection admission, so an anonymous command-line probe is
 answered with a JSON 401 before any snapshot logic; it is not a plugin failure.
@@ -124,13 +124,15 @@ Match the existing style; there is no formatter configuration to run and no lint
   admission check, and fail closed with a JSON 401 when that check throws. Hosts without the service
   keep their own access control. Never add a second authentication mechanism.
 - Resolve optional services with `ctx.get(...)` per request and guard every call. Missing Agent
-  Teams support must produce a valid `unsupported` snapshot, not an error.
+  Teams support must produce a valid `unsupported` snapshot, not an error. The optional
+  `workspaceRegistry` service is used for project resolution only and must stay optional: without it
+  the host falls back to the Lead session cwd and otherwise returns `project: null`.
 - Keep the host stateless: no mutable module state, no timers, no filesystem access, no mutation of
-  service objects.
+  service objects. The whole aggregation stays synchronous; do not call async registry APIs.
 - Every response must be JSON-safe. Convert branded ids with `String(...)`, replace `undefined`
   with `null`, cap long strings, and catch unexpected aggregation errors into a valid JSON 500.
-- Keep the snapshot contract versioned (`VERSION`). Additive fields are fine; removing or renaming a
-  field requires a version bump and matching client support.
+- Keep the snapshot contract versioned (`VERSION`, currently `2`). Additive fields are fine;
+  removing or renaming a field requires a contract version bump and matching client support.
 
 ### Client half (`client.js`) rules
 
@@ -145,17 +147,24 @@ Match the existing style; there is no formatter configuration to run and no lint
   `AbortController` cleaned up on unmount. Polling pauses while the tab is hidden.
 - Use only `--dsw-*` theme tokens for colors, borders, and backgrounds; do not hardcode colors.
 - Every visible string goes through `t(...)`. Keep the Chinese and English dictionaries key-for-key
-  identical.
-- Keep member cards keyboard accessible (role, tab index, Enter/Space) and respect
-  `prefers-reduced-motion`.
+  identical; the manifest guard enforces this.
+- Readiness is derived, never re-derived in the UI: only pending tasks may show a ready marker
+  (`ready === true`) or a blocked marker (`ready === false`). In-progress and completed tasks must not
+  render a blocked warning even though the runtime reports `ready: false` for them, and a retained
+  `blockedBy` list alone must not be treated as blocked.
+- Keep member chips keyboard accessible (buttons with descriptive labels, focus-visible outlines) and
+  respect `prefers-reduced-motion`. Team headers and the completed-tasks toggle must expose
+  `aria-expanded` state.
+- The project filter is local UI state only: never persist it or require host configuration for it.
 
 ### Tests
 
 - Tests use `node:test` and `node:assert/strict` only; no test framework and no network access.
 - Drive the host from fake Cordis services and fake session logs, as the existing suite does.
-- Cover defensive behavior: unknown event shapes, missing services, throwing services, connection
-  admission (401, 403, and fail-closed on a throwing check), JSON safety, and the 200/404/500 route
-  shapes.
+- Cover defensive behavior: project resolution (workspace matches, cwd fallback, missing/throwing
+  registry), active-first ordering, the `idle`/`ready` counts and `active` flags, unknown event
+  shapes, missing services, throwing services, connection admission (401, 403, and fail-closed on a
+  throwing check), JSON safety, and the 200/404/500 route shapes.
 - A new snapshot field or behavior change should come with a test that would fail without the change.
 
 ### Manifest and DSH plugin rules
@@ -171,7 +180,8 @@ The DSH loader depends on these cross-file invariants; `scripts/ci-guard.mjs` en
   page.
 - Keep `engines.dsh` at `>=0.2.1-rc.2 <0.3.0-0` unless the tested DSH range changes; the trailing
   `-0` also rejects 0.3.0 prereleases, and the manifest guard checks the exact value.
-- The client registration `id` equals the package name.
+- The client registration `id` equals the package name, and the embedded client `zh`/`en` dictionaries
+  keep identical key sets (the manifest guard checks both).
 - Locale metadata files remain valid JSON with `meta.title` and `meta.description`.
 
 Do not publish, tag releases, or bump the version in a pull request; releases are cut by

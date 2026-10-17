@@ -5,17 +5,41 @@
  *
  *   GET /api/team-console/snapshot
  *
- * and answers with a self-contained JSON snapshot of every live Agent Team that
- * the Host services `agentTeams` / `agents` / `sessions` can see. The Client half
- * (`client.js`) polls this endpoint; this file never touches the disk, never
- * starts timers, and keeps no mutable module state — every request rebuilds the
- * snapshot from the live services.
+ * and answers with a self-contained JSON snapshot (contract version 2) of every
+ * live Agent Team that the Host services `agentTeams` / `agents` / `sessions`
+ * and the optional `workspaceRegistry` can see. The Client half (`client.js`)
+ * polls this endpoint; this file never touches the disk, never starts timers,
+ * and keeps no mutable module state — every request rebuilds the snapshot from
+ * the live services.
+ *
+ * Contract version 2 additions (see docs/design.md):
+ *  - Every listed team carries `project` (`{ id, title, path }` or null). It is
+ *    resolved best effort from the optional `workspaceRegistry` service (an
+ *    entity whose `sessionIds` owns the Lead session first, then a
+ *    case-insensitive workspace-path match against the Lead session's immutable
+ *    creation-header `cwd`) and otherwise falls back to a synthetic
+ *    `id: 'cwd:' + cwd` project titled by the directory basename. A workspace
+ *    entity without a usable title is titled by its path basename too. Teams
+ *    with neither a workspace nor a cwd stay listed with `project: null`.
+ *  - `active` flags surface the work in progress: a team is active when it has
+ *    a running/provisioning member or an in-progress task, a member is active
+ *    when running/provisioning, and a task is active when in progress.
+ *  - Per-team counts add `idle` (inactive members) and `ready` (pending tasks
+ *    with `ready === true`).
+ *  - Top-level `totals` add `activeTeams`, `pending`, `inProgress` and
+ *    `blocked`; top-level `projects` aggregates only the projects that own at
+ *    least one listed team.
+ *  - Teams are ordered active first, then most recent observed activity (the
+ *    previous activityAt order). Projects are ordered by `activeTeams` desc,
+ *    `teams` desc, then `title`.
  *
  * Design constraints (see docs/design.md):
  *  - Zero `import` statements, so plain `node` can import and unit-test this file.
- *  - `agentTeams` / `agents` / `sessions` are OPTIONAL: resolved per request with
- *    `ctx.get(name)` and guarded. Missing Agent Teams support degrades to
- *    `unsupported` instead of throwing.
+ *  - `agentTeams` / `agents` / `sessions` / `workspaceRegistry` are OPTIONAL:
+ *    resolved per request with `ctx.get(name)` and guarded. Missing Agent Teams
+ *    support degrades to `unsupported` instead of throwing; a missing workspace
+ *    registry degrades to the cwd fallback. The whole aggregation stays
+ *    synchronous: no async request work, timers, disk access or mutations.
  *  - When the DSH `connection` service is mounted, every request passes its
  *    Host/Origin fence and browser-session admission before the route answers,
  *    so an anonymous HTTP client is rejected the same way as the Web UI itself.
@@ -30,7 +54,10 @@
 export const inject = ['webServer']
 
 /** Snapshot contract version. */
-export const VERSION = 1
+export const VERSION = 2
+
+/** Valid JSON body used only when a response body cannot be encoded at all. */
+const ENCODING_FALLBACK = `{"version":${VERSION},"ok":false,"error":"snapshot could not be encoded","teams":[]}`
 
 const ROUTE_PREFIX = '/api/team-console'
 const SNAPSHOT_PATH = '/api/team-console/snapshot'
@@ -511,6 +538,11 @@ function normalizeContext(value) {
   return value === 'fresh' || value === 'fork' ? value : null
 }
 
+/** Active team member: currently running or being provisioned. */
+function isMemberActive(status) {
+  return status === 'running' || status === 'provisioning'
+}
+
 /**
  * Normalize one TeamMemberView into the contract member row (session fields are
  * filled in afterwards by enrichMemberFromSession).
@@ -519,11 +551,12 @@ function normalizeMemberRow(view, leadId) {
   const raw = isRecord(view) ? view : {}
   const id = toId(raw.id)
   const isLead = raw.role === 'lead' || (id !== '' && id === leadId)
+  const status = normalizeMemberStatus(raw.status)
   return {
     id,
     name: firstText(raw.name) ?? (isLead ? 'lead' : 'unknown'),
     role: isLead ? 'lead' : 'teammate',
-    status: normalizeMemberStatus(raw.status),
+    status,
     description: capText(firstText(raw.description), DESCRIPTION_MAX),
     provider: firstText(raw.provider),
     model: firstText(raw.model),
@@ -533,6 +566,7 @@ function normalizeMemberRow(view, leadId) {
     lastEventType: null,
     turns: null,
     steps: null,
+    active: isMemberActive(status),
   }
 }
 
@@ -556,6 +590,7 @@ function normalizeTaskRow(view) {
     ready: raw.ready === true,
     writeScopes: toStringList(raw.writeScopes),
     writeScopeWarnings: toStringList(raw.writeScopeWarnings),
+    active: normalizedStatus === 'in_progress',
   }
 }
 
@@ -565,20 +600,24 @@ function computeTeamCounts(members, tasks) {
     running: 0,
     provisioning: 0,
     failed: 0,
+    idle: 0,
     tasks: tasks.length,
     pending: 0,
     inProgress: 0,
     completed: 0,
     blocked: 0,
+    ready: 0,
   }
   for (const member of members) {
     if (member.status === 'running') counts.running += 1
     else if (member.status === 'provisioning') counts.provisioning += 1
+    else if (member.status === 'inactive') counts.idle += 1
     else if (member.status === 'failed') counts.failed += 1
   }
   for (const task of tasks) {
     if (task.status === 'pending') {
       counts.pending += 1
+      if (task.ready === true) counts.ready += 1
       if (task.ready === false && task.blockedBy.length > 0) counts.blocked += 1
     } else if (task.status === 'in_progress') counts.inProgress += 1
     else if (task.status === 'completed') counts.completed += 1
@@ -586,16 +625,238 @@ function computeTeamCounts(members, tasks) {
   return counts
 }
 
+/** A team is active while any of its members or its task board is working. */
+function isTeamActive(counts) {
+  return counts.provisioning > 0 || counts.running > 0 || counts.inProgress > 0
+}
+
 function computeTotals(teams) {
-  const totals = { teams: teams.length, members: 0, running: 0, tasks: 0, completed: 0 }
+  const totals = {
+    teams: teams.length,
+    activeTeams: 0,
+    members: 0,
+    running: 0,
+    tasks: 0,
+    pending: 0,
+    inProgress: 0,
+    blocked: 0,
+    completed: 0,
+  }
   for (const team of teams) {
     const counts = team.counts
+    if (team.active === true) totals.activeTeams += 1
     totals.members += counts.members
     totals.running += counts.running
     totals.tasks += counts.tasks
+    totals.pending += counts.pending
+    totals.inProgress += counts.inProgress
+    totals.blocked += counts.blocked
     totals.completed += counts.completed
   }
   return totals
+}
+
+/**
+ * Aggregate the listed teams' resolved projects. Only projects that own at least
+ * one listed team are returned (teams with `project: null` are not grouped into
+ * a virtual project; the Client shows them under its all-projects filter).
+ * Order: activeTeams desc, teams desc, then title asc.
+ * @param teams - listed contract team objects.
+ */
+function computeProjects(teams) {
+  const byId = new Map()
+  for (const team of teams) {
+    const project = isRecord(team.project) ? team.project : null
+    if (project === null) continue
+    const id = toId(project.id)
+    let aggregate = byId.get(id)
+    if (aggregate === undefined) {
+      aggregate = {
+        id,
+        title: firstText(project.title),
+        path: firstText(project.path),
+        teams: 0,
+        activeTeams: 0,
+        running: 0,
+        inProgress: 0,
+      }
+      byId.set(id, aggregate)
+    }
+    aggregate.teams += 1
+    if (team.active === true) aggregate.activeTeams += 1
+    aggregate.running += team.counts.running
+    aggregate.inProgress += team.counts.inProgress
+  }
+  const projects = [...byId.values()]
+  projects.sort((left, right) => {
+    if (right.activeTeams !== left.activeTeams) return right.activeTeams - left.activeTeams
+    if (right.teams !== left.teams) return right.teams - left.teams
+    const leftTitle = left.title === null ? '' : left.title
+    const rightTitle = right.title === null ? '' : right.title
+    return leftTitle < rightTitle ? -1 : leftTitle > rightTitle ? 1 : 0
+  })
+  return projects
+}
+
+// ---------------------------------------------------------------------------
+// Project / workspace resolution (v2)
+// ---------------------------------------------------------------------------
+//
+// The optional Host `workspaceRegistry` service lists durable workspaces as
+// entities with `{ id, path, title, sessionIds }` (all synchronous getters; the
+// registry is NOT a required service). A team is tied to a project in three
+// best-effort steps:
+//   1. workspace entity whose `sessionIds` owns the Lead session id;
+//   2. else workspace entity whose `path` equals the Lead session cwd
+//      case-insensitively with `/` and `\` unified;
+//   3. else a synthetic `cwd:<path>` project from the Lead session's immutable
+//      creation header; teams with neither a workspace nor a cwd get null.
+
+/** Basename of a Host path without importing `node:path`. Handles `/` and `\`. */
+function pathBasename(path) {
+  if (typeof path !== 'string' || path.length === 0) return null
+  let end = path.length
+  while (end > 0 && (path[end - 1] === '/' || path[end - 1] === '\\')) end -= 1
+  // `/`, `\` or an empty-after-separator path: there is no final segment.
+  if (end === 0) return path
+  // Drive root (`C:`, `C:\`, `C:/`) and bare roots fall back to the path itself.
+  if (end === 2 && path[1] === ':' && /^[A-Za-z]$/.test(path[0])) return path
+  let start = end
+  while (start > 0 && path[start - 1] !== '/' && path[start - 1] !== '\\') start -= 1
+  return path.slice(start, end)
+}
+
+/**
+ * Comparison key for a Host path: unify separators, drop trailing separators and
+ * lowercase (Windows paths are case-insensitive). Display values stay untouched.
+ */
+function pathKey(path) {
+  if (typeof path !== 'string' || path.length === 0) return ''
+  let text = path.replace(/\\/g, '/')
+  while (text.length > 1 && text.endsWith('/')) text = text.slice(0, -1)
+  return text.toLowerCase()
+}
+
+/**
+ * Read the Lead session's immutable creation-header cwd. The header is optional
+ * and may legally omit `cwd`, so the absence degrades to null, never throws.
+ */
+function leadSessionCwd(session) {
+  if (!isRecord(session)) return null
+  try {
+    const header = session.header
+    if (!isRecord(header)) return null
+    return typeof header.cwd === 'string' && header.cwd.length > 0 ? header.cwd : null
+  } catch {
+    return null
+  }
+}
+
+/** Lead session id (the team id), with the team id as a defensive fallback. */
+function leadSessionId(session, teamId) {
+  if (!isRecord(session)) return teamId
+  try {
+    const id = toId(session.id)
+    return id === '' ? teamId : id
+  } catch {
+    return teamId
+  }
+}
+
+/**
+ * Display title for a workspace-derived project: the trimmed entity title when
+ * it has visible text, else the path basename (same rules as the cwd fallback,
+ * including drive roots), else the raw path, else the project id. Always a
+ * non-empty string, so the Client's project filter/chip never renders a blank
+ * label (defensive only: runtime workspace entities always carry a title).
+ * @param rawTitle - `firstText(entity.title)`.
+ * @param path - `firstText(entity.path)`.
+ * @param id - non-empty project id.
+ */
+function workspaceProjectTitle(rawTitle, path, id) {
+  if (typeof rawTitle === 'string') {
+    const trimmed = rawTitle.trim()
+    if (trimmed.length > 0) return trimmed
+  }
+  const basename = pathBasename(path)
+  if (basename !== null && basename.trim().length > 0) return basename
+  if (typeof path === 'string' && path.trim().length > 0) return path
+  return id
+}
+
+/** Contract project object from one workspace entity, or null when unusable. */
+function workspaceProject(entity) {
+  if (!isRecord(entity)) return null
+  try {
+    const id = toId(entity.id)
+    if (id === '') return null
+    const path = firstText(entity.path)
+    return { id, title: workspaceProjectTitle(firstText(entity.title), path, id), path }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Find the workspace that owns one team. A `sessionIds` match wins over a path
+ * match regardless of registry order; path matching is case-insensitive across
+ * `/` and `\` spellings. `list()` entity getters are guarded one by one so a
+ * single malformed entity cannot abandon the rest of the registry.
+ */
+function findWorkspaceProject(workspaces, sessionId, cwd) {
+  const key = cwd === null ? '' : pathKey(cwd)
+  let pathMatch = null
+  for (const entity of workspaces) {
+    const project = workspaceProject(entity)
+    if (project === null) continue
+    if (sessionId !== '') {
+      let sessionIds = []
+      try {
+        const value = entity.sessionIds
+        if (Array.isArray(value)) sessionIds = value
+      } catch {
+        sessionIds = []
+      }
+      if (sessionIds.some((id) => toId(id) === sessionId)) return project
+    }
+    if (pathMatch === null && key !== '' && project.path !== null && pathKey(project.path) === key) pathMatch = project
+  }
+  return pathMatch
+}
+
+/**
+ * Resolve one team's `project`, best effort, never throwing. Returns null when
+ * neither the workspace registry nor the Lead session cwd is available.
+ * @param teamId - Lead session id / team id.
+ * @param leadSession - live Lead Session (may be undefined).
+ * @param workspaces - workspace registry entities, already listed.
+ */
+function resolveTeamProject(teamId, leadSession, workspaces) {
+  try {
+    const cwd = leadSessionCwd(leadSession)
+    const sessionId = leadSessionId(leadSession, teamId)
+    const workspace = findWorkspaceProject(workspaces, sessionId, cwd)
+    if (workspace !== null) return workspace
+    if (cwd === null) return null
+    return { id: `cwd:${cwd}`, title: pathBasename(cwd), path: cwd }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Read the optional workspace registry's synchronous list. Missing services,
+ * throwing calls and non-array results all degrade to "no workspaces", which
+ * keeps project resolution on the cwd fallback.
+ */
+function listWorkspaces(workspaceRegistry) {
+  if (!workspaceRegistry || typeof workspaceRegistry.list !== 'function') return []
+  try {
+    const value = workspaceRegistry.list()
+    return Array.isArray(value) ? value : []
+  } catch {
+    return []
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -617,12 +878,17 @@ function unsupportedReason(agentTeams, agents) {
 }
 
 /**
- * Build one team entry plus its sort key (most recent observed activity time).
- * Roster/task read failures become `team.error` and degrade to whatever was
- * readable; a team always lists its Lead row.
- * @returns `{ team, activityAt }`.
+ * Build one team entry plus its sort keys (active flag and most recent observed
+ * activity time). Roster/task read failures become `team.error` and degrade to
+ * whatever was readable; a team always lists its Lead row. Listed teams also
+ * resolve `project` best effort (v2 contract).
+ * @param membership - Agent Team membership row from `agentTeams.tryMembership`.
+ * @param agentTeams - Agent Teams service.
+ * @param sessions - optional `sessions` service.
+ * @param workspaces - workspace registry entities from listWorkspaces().
+ * @returns `{ team, activityAt, listable }`.
  */
-function buildTeam(membership, agentTeams, sessions) {
+function buildTeam(membership, agentTeams, sessions, workspaces) {
   const rootAgent = isRecord(membership.root) ? membership.root : undefined
   const rootAgentId = rootAgent !== undefined ? rootAgent.id : undefined
   const teamId = toId(membership.id ?? rootAgentId)
@@ -662,14 +928,15 @@ function buildTeam(membership, agentTeams, sessions) {
   // real Team activity are listed, so skip the expensive session reads for the
   // rest of the live agents.
   const counts = computeTeamCounts(members, tasks)
+  const active = isTeamActive(counts)
   const listable = counts.members > 1 || counts.tasks > 0
 
   let activity = []
+  let leadSession
   if (listable) {
     const memberNames = new Map()
     for (const member of members) memberNames.set(member.id, member.name)
     for (const member of members) enrichMemberFromSession(member, sessions)
-    let leadSession
     if (sessions && typeof sessions.get === 'function') {
       try {
         leadSession = sessions.get(teamId)
@@ -679,10 +946,15 @@ function buildTeam(membership, agentTeams, sessions) {
     }
     activity = normalizeActivity(leadSession, { memberNames, teamId })
   }
+  // Non-listable teams never reach the snapshot, so project resolution (and its
+  // workspace/session reads) is only paid for the teams the Client can see.
+  const project = listable ? resolveTeamProject(teamId, leadSession, workspaces) : null
 
   const team = {
     id: teamId,
     error: teamError,
+    project,
+    active,
     counts,
     members,
     tasks,
@@ -700,18 +972,21 @@ function buildTeam(membership, agentTeams, sessions) {
 }
 
 /**
- * Collect every live team as contract team objects, most recent first.
- * A team is listed only when it has more than one member or at least one task
- * (every ordinary runtime root is an implicit one-person Lead, so unfiltered
- * enumeration would surface unrelated sessions).
+ * Collect every live team as contract team objects: active teams first, then by
+ * most recent observed activity. A team is listed only when it has more than one
+ * member or at least one task (every ordinary runtime root is an implicit
+ * one-person Lead, so unfiltered enumeration would surface unrelated sessions).
+ * The optional workspace registry is listed once per snapshot for project
+ * resolution; it never adds a required service.
  * @param ctx - Cordis plugin context.
- * @returns team objects, most recent activity first.
+ * @returns team objects, active first then most recent activity first.
  */
 export function collectTeams(ctx) {
   const agentTeams = getService(ctx, 'agentTeams')
   const agents = getService(ctx, 'agents')
-  const sessions = getService(ctx, 'sessions')
   if (unsupportedReason(agentTeams, agents) !== null) return []
+  const sessions = getService(ctx, 'sessions')
+  const workspaces = listWorkspaces(getService(ctx, 'workspaceRegistry'))
 
   const liveAgents = agents.list()
   if (!Array.isArray(liveAgents)) return []
@@ -730,10 +1005,13 @@ export function collectTeams(ctx) {
     const teamId = toId(membership.id ?? (isRecord(membership.root) ? membership.root.id : agent.id))
     if (teamId === '' || seen.has(teamId)) continue
     seen.add(teamId)
-    entries.push(buildTeam(membership, agentTeams, sessions))
+    entries.push(buildTeam(membership, agentTeams, sessions, workspaces))
   }
 
-  entries.sort((left, right) => right.activityAt - left.activityAt)
+  entries.sort((left, right) => {
+    const activeDelta = Number(right.team.active === true) - Number(left.team.active === true)
+    return activeDelta !== 0 ? activeDelta : right.activityAt - left.activityAt
+  })
   const teams = []
   for (const entry of entries) {
     if (entry.listable) teams.push(entry.team)
@@ -758,6 +1036,7 @@ export function createSnapshot(ctx) {
     generatedAt: Date.now(),
     unsupported,
     totals: computeTotals(teams),
+    projects: computeProjects(teams),
     teams,
   })
 }
@@ -772,9 +1051,9 @@ function writeJson(res, statusCode, body) {
   try {
     payload = JSON.stringify(toJsonSafe(body))
   } catch {
-    payload = '{"version":1,"ok":false,"error":"snapshot could not be encoded","teams":[]}'
+    payload = ENCODING_FALLBACK
   }
-  if (typeof payload !== 'string') payload = '{"version":1,"ok":false,"error":"snapshot could not be encoded","teams":[]}'
+  if (typeof payload !== 'string') payload = ENCODING_FALLBACK
   try {
     res.writeHead(statusCode, {
       'content-type': 'application/json; charset=utf-8',

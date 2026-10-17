@@ -106,10 +106,67 @@ if (pkg !== null) {
 // client.js: the self-registering browser bundle
 // ---------------------------------------------------------------------------
 
+/**
+ * Extract the top-level keys of one embedded client dictionary literal
+ * (`const zh = { ... }` / `const en = { ... }`) from client.js.
+ * Supports quoted and bare identifier keys; returns null when the literal is
+ * missing or unbalanced.
+ * @param source - client.js source text.
+ * @param name - zh or en.
+ * @returns string[] of keys, or null.
+ */
+function clientDictionaryKeys(source, name) {
+  const marker = `const ${name} = {`
+  const start = source.indexOf(marker)
+  if (start < 0) return null
+  const open = start + marker.length - 1
+  let depth = 0
+  let end = -1
+  for (let i = open; i < source.length; i += 1) {
+    const character = source[i]
+    if (character === '{') depth += 1
+    else if (character === '}') {
+      depth -= 1
+      if (depth === 0) {
+        end = i
+        break
+      }
+    }
+  }
+  if (end < 0) return null
+  const block = source.slice(open + 1, end)
+  const keys = []
+  const pattern = /^\s*(?:(?:'([^']+)')|(?:"([^"]+)")|([A-Za-z_$][\w$]*))\s*:/gm
+  let match
+  while ((match = pattern.exec(block)) !== null) keys.push(match[1] ?? match[2] ?? match[3])
+  return keys
+}
+
 const clientSource = readText('client.js')
 if (clientSource !== null) {
   check(/id:\s*['"]dsh-agent-team-console['"]/.test(clientSource), "client.js registers id 'dsh-agent-team-console'")
   check(!/require\(\s*['"]@deepseek-ai\//.test(clientSource), 'client.js does not require any @deepseek-ai/ module')
+
+  // The client embeds its own bilingual dictionaries; drifting keys means one
+  // language silently falls back to a raw key at runtime.
+  const zhKeys = clientDictionaryKeys(clientSource, 'zh')
+  const enKeys = clientDictionaryKeys(clientSource, 'en')
+  check(Array.isArray(zhKeys) && zhKeys.length > 0, 'client.js embeds a non-empty zh dictionary')
+  check(Array.isArray(enKeys) && enKeys.length > 0, 'client.js embeds a non-empty en dictionary')
+  if (Array.isArray(zhKeys) && Array.isArray(enKeys)) {
+    const enSet = new Set(enKeys)
+    const zhSet = new Set(zhKeys)
+    const missingInEn = zhKeys.filter((key) => !enSet.has(key))
+    const missingInZh = enKeys.filter((key) => !zhSet.has(key))
+    check(
+      missingInEn.length === 0,
+      `client zh/en dictionaries agree (keys missing in en: ${missingInEn.join(', ') || 'none'})`,
+    )
+    check(
+      missingInZh.length === 0,
+      `client zh/en dictionaries agree (keys missing in zh: ${missingInZh.join(', ') || 'none'})`,
+    )
+  }
 }
 
 // ---------------------------------------------------------------------------

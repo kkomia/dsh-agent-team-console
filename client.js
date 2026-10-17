@@ -1,5 +1,5 @@
 /**
- * dsh-agent-team-console — Client half (browser bundle).
+ * dsh-agent-team-console — Client half (browser bundle), snapshot contract v2.
  * ============================================================================
  * Self-registering classic script loaded through window.__ModuleLoader__:
  *   - id MUST equal the package name.
@@ -7,11 +7,18 @@
  *   - Registers a sidebar.panellist entry (id 'team-console') and a keyed
  *     main panel (key 'team-console') that polls the Host half at
  *     GET /api/team-console/snapshot (same origin, read-only, 2s cadence).
+ *   - Read-only, in-progress-first design (contract v1.1.0):
+ *       header (project filter, live dot, refresh)
+ *       -> compact status chip strip (in-progress / running / blocked / pending)
+ *       -> per-team section (active expanded, idle collapsed): roster chips,
+ *          in-progress task cards, compact pending rows, collapsed completed
+ *          group, compact activity list.
  *   - All copy is bilingual through the Client locale service under the
- *     namespace 'agent-team-console' (zh + en kept in sync).
- *   - Colors/borders/backgrounds come exclusively from --dsw-alias-* theme
- *     tokens; the single <style> element lives in the Panel render so it is
- *     disposed together with the panel.
+ *     namespace 'agent-team-console' (zh + en kept key-for-key in sync); the
+ *     Chinese dictionary is primary and the English one mirrors it.
+ *   - Colors/borders/backgrounds come exclusively from --dsw-* theme tokens;
+ *     the single <style> element lives in the Panel render so it is disposed
+ *     together with the panel.
  * ============================================================================
  */
 window.__ModuleLoader__.load({
@@ -23,7 +30,8 @@ window.__ModuleLoader__.load({
     const NS = 'agent-team-console'
     const API = '/api/team-console/snapshot'
     const POLL_MS = 2000
-    const ACTIVITY_LIMIT = 12
+    const ACTIVITY_LIMIT = 8
+    const MEMBER_LIMIT = 8
 
     /* ------------------------------------------------------------------ */
     /* Locale dictionaries (zh + en, identical key sets)                   */
@@ -32,7 +40,7 @@ window.__ModuleLoader__.load({
     const zh = {
       'panel.label': '团队看板',
       title: 'Agent Team 看板',
-      subtitle: '实时查看成员状态、共享任务板与协作动态',
+      subtitle: '按项目查看进行中的工作、成员与协作动态',
       live: '实时 · {interval}',
       refresh: '刷新',
       refreshing: '正在刷新',
@@ -45,30 +53,30 @@ window.__ModuleLoader__.load({
       'unsupported.title': 'Agent Teams 服务未挂载',
       'unsupported.body': '当前运行环境没有提供 Agent Teams 服务：{message}',
       'empty.title': '还没有正在运行的 Agent Team',
-      'empty.body': '在会话中创建队友或共享任务后，它们会自动出现在这里。本页是只读视图，不会修改任何团队状态。',
+      'empty.body': '在会话中创建队友或共享任务后，它们会自动出现在这里；空闲的团队也会保留在列表中。本页是只读视图，不会修改任何团队状态。',
       'empty.unsupported': '当前 profile 未提供 Agent Teams 服务，因此这里不会列出任何团队。',
-      'kpi.members': '团队成员',
-      'kpi.membersContext': '{running}/{total} 运行中',
-      'kpi.tasks': '共享任务',
-      'kpi.tasksContext': '{completed}/{total} 已完成',
-      'kpi.inProgress': '进行中',
-      'kpi.inProgressContext': '正在执行的任务',
-      'kpi.blocked': '阻塞',
-      'kpi.blockedContext': '等待依赖或未就绪',
-      'section.team': '团队',
+      'filter.label': '按项目筛选',
+      'filter.all': '全部项目',
+      'project.none': '未归属项目',
+      'stat.inProgress': '进行中任务',
+      'stat.runningMembers': '运行成员',
+      'stat.blocked': '阻塞任务',
+      'stat.pending': '待处理任务',
+      'section.inProgress': '进行中',
+      'section.pending': '待处理',
+      'section.completed': '已完成',
       'section.roster': '成员',
-      'section.tasks': '共享任务',
       'section.activity': '最新动态',
-      'team.summary': '{name} · {id} · {updated}',
-      'team.idUpdated': '{id} · {updated}',
+      'team.idle': '空闲',
+      'team.expand': '展开',
+      'team.collapse': '收起',
       'team.unnamed': '未命名团队',
       'team.error': '团队数据读取失败：{message}',
+      'team.members': '成员 {n}',
+      'team.inProgress': '进行中 {n}',
+      'team.blocked': '阻塞 {n}',
       'roster.empty': '暂无成员',
-      'tasks.empty': '还没有共享任务',
-      'activity.empty': '暂无最近动态',
-      'activity.unknown': '未知动态',
-      'context.fresh': '全新上下文',
-      'context.fork': '继承上下文',
+      'roster.more': '另有 {n}',
       'member.role.lead': 'Lead',
       'member.role.teammate': 'Teammate',
       'member.status.running': '运行中',
@@ -76,15 +84,9 @@ window.__ModuleLoader__.load({
       'member.status.provisioning': '准备中',
       'member.status.failed': '失败',
       'member.open': '打开成员会话',
-      'member.lastActive': '{time} · {event}',
-      'member.noActivity': '暂无活动记录',
-      'member.diagnostics': '诊断信息',
       'status.pending': '待处理',
       'status.in_progress': '进行中',
       'status.completed': '已完成',
-      'task.col.pending': '待办',
-      'task.col.inProgress': '进行中',
-      'task.col.completed': '已完成',
       'task.owner': '负责人：{name}',
       'task.unowned': '未分配',
       'task.ready': '可开始',
@@ -93,7 +95,12 @@ window.__ModuleLoader__.load({
       'task.scopesLabel': '写入范围',
       'task.expand': '展开说明',
       'task.collapse': '收起说明',
-      'task.emptyColumn': '暂无任务',
+      'tasks.empty': '还没有共享任务',
+      'tasks.noInProgress': '暂无进行中的任务',
+      'tasks.completedCount': '已完成 {n}',
+      'tasks.completedToggle': '展开或收起已完成任务',
+      'activity.empty': '暂无最近动态',
+      'activity.unknown': '未知动态',
       'action.spawn': '创建',
       'action.create': '创建',
       'action.claim': '认领',
@@ -115,7 +122,7 @@ window.__ModuleLoader__.load({
     const en = {
       'panel.label': 'Team console',
       title: 'Agent Team Console',
-      subtitle: 'Live roster, shared task board, and collaboration activity',
+      subtitle: 'In-progress work, members, and activity by project',
       live: 'Live · {interval}',
       refresh: 'Refresh',
       refreshing: 'Refreshing',
@@ -128,30 +135,30 @@ window.__ModuleLoader__.load({
       'unsupported.title': 'Agent Teams service is not mounted',
       'unsupported.body': 'The current runtime does not provide the Agent Teams service: {message}',
       'empty.title': 'No running Agent Team yet',
-      'empty.body': 'Teammates and shared tasks appear here automatically once you spawn them in a conversation. This page is read-only and never changes team state.',
+      'empty.body': 'Teammates and shared tasks appear here automatically once you spawn them in a conversation; idle teams stay listed too. This page is read-only and never changes team state.',
       'empty.unsupported': 'The current profile does not provide the Agent Teams service, so no teams can be listed.',
-      'kpi.members': 'Team members',
-      'kpi.membersContext': '{running}/{total} running',
-      'kpi.tasks': 'Shared tasks',
-      'kpi.tasksContext': '{completed}/{total} completed',
-      'kpi.inProgress': 'In progress',
-      'kpi.inProgressContext': 'Tasks being worked on',
-      'kpi.blocked': 'Blocked',
-      'kpi.blockedContext': 'Waiting on dependencies',
-      'section.team': 'Team',
+      'filter.label': 'Filter by project',
+      'filter.all': 'All projects',
+      'project.none': 'No project',
+      'stat.inProgress': 'In-progress tasks',
+      'stat.runningMembers': 'Running members',
+      'stat.blocked': 'Blocked tasks',
+      'stat.pending': 'Pending tasks',
+      'section.inProgress': 'In progress',
+      'section.pending': 'Pending',
+      'section.completed': 'Completed',
       'section.roster': 'Members',
-      'section.tasks': 'Shared tasks',
       'section.activity': 'Recent activity',
-      'team.summary': '{name} · {id} · {updated}',
-      'team.idUpdated': '{id} · {updated}',
+      'team.idle': 'Idle',
+      'team.expand': 'Expand',
+      'team.collapse': 'Collapse',
       'team.unnamed': 'Unnamed team',
       'team.error': 'Team data could not be read: {message}',
+      'team.members': '{n} members',
+      'team.inProgress': '{n} in progress',
+      'team.blocked': '{n} blocked',
       'roster.empty': 'No members',
-      'tasks.empty': 'No shared tasks yet',
-      'activity.empty': 'No recent activity',
-      'activity.unknown': 'Unknown activity',
-      'context.fresh': 'Fresh context',
-      'context.fork': 'Forked context',
+      'roster.more': '{n} more',
       'member.role.lead': 'Lead',
       'member.role.teammate': 'Teammate',
       'member.status.running': 'Running',
@@ -159,15 +166,9 @@ window.__ModuleLoader__.load({
       'member.status.provisioning': 'Provisioning',
       'member.status.failed': 'Failed',
       'member.open': 'Open member conversation',
-      'member.lastActive': '{time} · {event}',
-      'member.noActivity': 'No activity yet',
-      'member.diagnostics': 'Diagnostics',
       'status.pending': 'Pending',
       'status.in_progress': 'In progress',
       'status.completed': 'Completed',
-      'task.col.pending': 'To do',
-      'task.col.inProgress': 'In progress',
-      'task.col.completed': 'Done',
       'task.owner': 'Owner: {name}',
       'task.unowned': 'Unassigned',
       'task.ready': 'Ready',
@@ -176,7 +177,12 @@ window.__ModuleLoader__.load({
       'task.scopesLabel': 'Write scopes',
       'task.expand': 'Show description',
       'task.collapse': 'Hide description',
-      'task.emptyColumn': 'No tasks',
+      'tasks.empty': 'No shared tasks yet',
+      'tasks.noInProgress': 'No task in progress',
+      'tasks.completedCount': 'Completed {n}',
+      'tasks.completedToggle': 'Expand or collapse completed tasks',
+      'activity.empty': 'No recent activity',
+      'activity.unknown': 'Unknown activity',
       'action.spawn': 'spawned',
       'action.create': 'created',
       'action.claim': 'claimed',
@@ -216,6 +222,7 @@ window.__ModuleLoader__.load({
     }
 
     const hasKey = (key) => Object.prototype.hasOwnProperty.call(zh, key)
+    const hasOwn = (object, key) => Object.prototype.hasOwnProperty.call(object, key)
 
     /* ------------------------------------------------------------------ */
     /* Small pure helpers                                                  */
@@ -298,17 +305,18 @@ window.__ModuleLoader__.load({
       return formatShortDate(value)
     }
 
+    function pathBasename(path) {
+      const raw = asString(path).replace(/[\\/]+$/, '')
+      if (!raw) return ''
+      const parts = raw.split(/[\\/]+/)
+      return parts[parts.length - 1] || raw
+    }
+
     function actionLabel(action, t) {
       const raw = asString(action)
       if (!raw) return ''
       const key = 'action.' + raw
       return hasKey(key) ? t(key) : raw
-    }
-
-    function taskStatusLabel(status, t) {
-      const raw = asString(status)
-      const key = 'status.' + raw
-      return raw && hasKey(key) ? t(key) : raw || '—'
     }
 
     function memberStatusLabel(status, t) {
@@ -317,64 +325,157 @@ window.__ModuleLoader__.load({
       return raw && hasKey(key) ? t(key) : raw || '—'
     }
 
-    function memberContextLabel(context, t) {
-      const raw = asString(context)
-      if (raw === 'fresh') return t('context.fresh')
-      if (raw === 'fork') return t('context.fork')
-      return raw
+    function memberStatusTone(status) {
+      const raw = asString(status)
+      if (raw === 'running') return 'running'
+      if (raw === 'provisioning') return 'provisioning'
+      if (raw === 'failed') return 'failed'
+      return 'inactive'
+    }
+
+    function memberRoleLabel(role, t) {
+      return asString(role) === 'lead' ? t('member.role.lead') : t('member.role.teammate')
     }
 
     /* ------------------------------------------------------------------ */
     /* Snapshot aggregation helpers (defensive about every field)          */
+    /*                                                                     */
+    /* Contract v2 semantics used below:                                   */
+    /*   - team.active === true when the team has provisioning/running     */
+    /*     members or in-progress tasks (host-computed, derived as a       */
+    /*     fallback for older snapshots).                                  */
+    /*   - member.active === running || provisioning; task.active ===      */
+    /*     status in_progress.                                             */
+    /*   - counts.idle = inactive members, counts.ready = ready pending    */
+    /*     tasks.                                                          */
     /* ------------------------------------------------------------------ */
 
-    function sumCounts(teams) {
-      const totals = {
-        teams: teams.length,
-        members: 0,
-        running: 0,
-        provisioning: 0,
-        failed: 0,
-        tasks: 0,
-        pending: 0,
-        inProgress: 0,
-        completed: 0,
-        blocked: 0,
+    function teamCounts(team) {
+      const counts = team && typeof team.counts === 'object' && team.counts ? team.counts : {}
+      const members = asArray(team && team.members)
+      const tasks = asArray(team && team.tasks)
+      const membersBy = (status) => members.filter((member) => asString(member && member.status) === status).length
+      const tasksBy = (status) => tasks.filter((task) => asString(task && task.status) === status).length
+      const blockedTasks = tasks.filter((task) => (
+        asString(task && task.status) !== 'completed' && asArray(task && task.blockedBy).length > 0
+      )).length
+      const readyTasks = tasks.filter((task) => (
+        asString(task && task.status) === 'pending' && task && task.ready === true
+      )).length
+      return {
+        members: numberOr(counts.members, members.length),
+        running: numberOr(counts.running, membersBy('running')),
+        provisioning: numberOr(counts.provisioning, membersBy('provisioning')),
+        failed: numberOr(counts.failed, membersBy('failed')),
+        idle: numberOr(counts.idle, membersBy('inactive')),
+        tasks: numberOr(counts.tasks, tasks.length),
+        pending: numberOr(counts.pending, tasksBy('pending')),
+        inProgress: numberOr(counts.inProgress, tasksBy('in_progress')),
+        completed: numberOr(counts.completed, tasksBy('completed')),
+        blocked: numberOr(counts.blocked, blockedTasks),
+        ready: numberOr(counts.ready, readyTasks),
       }
-      for (const team of teams) {
-        const counts = team && typeof team.counts === 'object' && team.counts ? team.counts : {}
-        const members = asArray(team && team.members)
-        const tasks = asArray(team && team.tasks)
-        const countBy = (status) => members.filter((member) => asString(member && member.status) === status).length
-        const taskBy = (status) => tasks.filter((task) => asString(task && task.status) === status).length
-        totals.members += numberOr(counts.members, members.length)
-        totals.running += numberOr(counts.running, countBy('running'))
-        totals.provisioning += numberOr(counts.provisioning, countBy('provisioning'))
-        totals.failed += numberOr(counts.failed, countBy('failed'))
-        totals.tasks += numberOr(counts.tasks, tasks.length)
-        totals.pending += numberOr(counts.pending, taskBy('pending'))
-        totals.inProgress += numberOr(counts.inProgress, taskBy('in_progress'))
-        totals.completed += numberOr(counts.completed, taskBy('completed'))
-        totals.blocked += numberOr(counts.blocked, tasks.filter((task) => (
-          asString(task && task.status) !== 'completed' && asArray(task && task.blockedBy).length > 0
-        )).length)
+    }
+
+    const TOTALS_KEYS = [
+      'members', 'running', 'provisioning', 'failed', 'idle',
+      'tasks', 'pending', 'inProgress', 'completed', 'blocked', 'ready',
+    ]
+
+    function teamActiveFromCounts(team, counts) {
+      if (team && typeof team.active === 'boolean') return team.active
+      return counts.provisioning > 0 || counts.running > 0 || counts.inProgress > 0
+    }
+
+    function teamActive(team) {
+      return teamActiveFromCounts(team, teamCounts(team))
+    }
+
+    function aggregateTeams(teams) {
+      const totals = { teams: 0, activeTeams: 0 }
+      for (const key of TOTALS_KEYS) totals[key] = 0
+      for (const team of asArray(teams)) {
+        const counts = teamCounts(team)
+        totals.teams += 1
+        if (teamActiveFromCounts(team, counts)) totals.activeTeams += 1
+        for (const key of TOTALS_KEYS) totals[key] += counts[key]
       }
       return totals
     }
 
-    function kpiModel(data) {
-      const teams = asArray(data && data.teams)
-      const totals = data && typeof data.totals === 'object' && data.totals ? data.totals : {}
-      const sums = sumCounts(teams)
-      const hasTeams = teams.length > 0
-      return {
-        members: hasTeams ? sums.members : numberOr(totals.members, 0),
-        running: hasTeams ? sums.running : numberOr(totals.running, 0),
-        tasks: hasTeams ? sums.tasks : numberOr(totals.tasks, 0),
-        completed: hasTeams ? sums.completed : numberOr(totals.completed, 0),
-        inProgress: hasTeams ? sums.inProgress : numberOr(totals.inProgress, 0),
-        blocked: hasTeams ? sums.blocked : numberOr(totals.blocked, 0),
+    function teamProject(team) {
+      const project = team && typeof team.project === 'object' && team.project ? team.project : null
+      if (!project) return null
+      const id = asString(project.id)
+      const title = asString(project.title)
+      const path = asString(project.path)
+      if (!id && !title && !path) return null
+      return { id, title, path: path || null }
+    }
+
+    function projectLabel(project, t) {
+      const title = asString(project && project.title)
+      if (title) return title
+      const base = pathBasename(project && project.path)
+      if (base) return base
+      return t('project.none')
+    }
+
+    /**
+     * Build the <option> model for the project filter. Duplicate project titles
+     * (same workspace basename in different folders) get the shortest unique
+     * path tail appended; ids are the last-resort discriminator.
+     */
+    function uniqueProjectOptions(projects, t) {
+      const entries = []
+      for (const project of asArray(projects)) {
+        const id = asString(project && project.id)
+        if (!id) continue
+        const path = asString(project && project.path)
+        const parts = path ? path.split(/[\\/]+/).filter(Boolean) : []
+        entries.push({ id, title: projectLabel(project, t), parts })
       }
+      const byTitle = new Map()
+      for (const entry of entries) {
+        const bucket = byTitle.get(entry.title)
+        if (bucket) bucket.push(entry)
+        else byTitle.set(entry.title, [entry])
+      }
+      const labels = new Map()
+      for (const [title, bucket] of byTitle) {
+        if (bucket.length === 1) {
+          labels.set(bucket[0], title)
+          continue
+        }
+        const maxParts = bucket.reduce((max, entry) => Math.max(max, entry.parts.length), 0)
+        let tails = null
+        for (let length = 1; length <= maxParts && tails === null; length += 1) {
+          const candidates = bucket.map((entry) => entry.parts.slice(-length).join('/'))
+          const unique = candidates.every(Boolean) && new Set(candidates).size === bucket.length
+          if (unique) tails = candidates
+        }
+        bucket.forEach((entry, index) => {
+          const tail = tails ? tails[index] : (entry.id.length > 8 ? entry.id.slice(-8) : entry.id)
+          labels.set(entry, title + ' · ' + tail)
+        })
+      }
+      return entries.map((entry) => ({ id: entry.id, label: labels.get(entry) || entry.title }))
+    }
+
+    function effectiveProjectId(projectId, projects) {
+      const wanted = asString(projectId)
+      if (!wanted || wanted === 'all') return 'all'
+      const exists = asArray(projects).some((project) => asString(project && project.id) === wanted)
+      return exists ? wanted : 'all'
+    }
+
+    function filterTeams(teams, projectId) {
+      const list = asArray(teams)
+      if (!projectId || projectId === 'all') return list
+      return list.filter((team) => {
+        const project = teamProject(team)
+        return project !== null && project.id === projectId
+      })
     }
 
     function teamLatestTime(team) {
@@ -388,6 +489,22 @@ window.__ModuleLoader__.load({
         if (value !== null && (latest === null || value > latest)) latest = value
       }
       return latest
+    }
+
+    function memberRank(member) {
+      const status = asString(member && member.status)
+      if (status === 'running' || status === 'provisioning') return 0
+      if (status === 'inactive') return 1
+      if (status === 'failed') return 2
+      return 3
+    }
+
+    /** Stable active-first ordering: running/provisioning, idle, failed. */
+    function sortMembers(members) {
+      return asArray(members)
+        .map((member, index) => ({ member, index }))
+        .sort((left, right) => (memberRank(left.member) - memberRank(right.member)) || (left.index - right.index))
+        .map((entry) => entry.member)
     }
 
     /* ------------------------------------------------------------------ */
@@ -423,13 +540,18 @@ window.__ModuleLoader__.load({
     const CSS = `
 .atc-root{box-sizing:border-box;height:100%;min-height:0;overflow-y:auto;overflow-x:hidden;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font-size:13px;line-height:1.5;}
 .atc-root,.atc-root *,.atc-root *::before,.atc-root *::after{box-sizing:border-box;}
-.atc-root button{font:inherit;color:inherit;}
-.atc-page{max-width:1120px;margin:0 auto;padding:28px 32px 48px;display:flex;flex-direction:column;gap:20px;}
-.atc-header{display:flex;align-items:flex-start;justify-content:space-between;gap:16px 24px;flex-wrap:wrap;}
-.atc-header-main{display:flex;flex-direction:column;gap:2px;min-width:0;}
-.atc-title{margin:0;font-size:21px;line-height:28px;font-weight:600;letter-spacing:-0.01em;}
-.atc-subtitle{margin:0;font-size:12.5px;line-height:18px;color:var(--dsw-alias-label-secondary);}
-.atc-header-side{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding-top:5px;}
+.atc-root button,.atc-root select{font:inherit;color:inherit;}
+.atc-page{max-width:1120px;margin:0 auto;padding:20px 24px 40px;display:flex;flex-direction:column;gap:14px;}
+.atc-header{display:flex;align-items:center;justify-content:space-between;gap:10px 20px;flex-wrap:wrap;}
+.atc-header-main{display:flex;flex-direction:column;gap:1px;min-width:0;}
+.atc-title{margin:0;font-size:18px;line-height:24px;font-weight:600;letter-spacing:-0.01em;}
+.atc-subtitle{margin:0;font-size:12px;line-height:16px;color:var(--dsw-alias-label-secondary);}
+.atc-header-side{display:flex;align-items:center;gap:10px;flex-wrap:wrap;}
+.atc-filter{position:relative;display:inline-flex;align-items:center;}
+.atc-select{height:28px;max-width:230px;padding:0 26px 0 10px;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font-size:12px;line-height:16px;cursor:pointer;appearance:none;-webkit-appearance:none;}
+.atc-select:hover{background:var(--dsw-alias-bg-layer-2);border-color:var(--dsw-alias-border-l2);}
+.atc-select:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px;}
+.atc-filter::after{content:"";position:absolute;right:10px;width:6px;height:6px;border-right:1.5px solid var(--dsw-alias-label-secondary);border-bottom:1.5px solid var(--dsw-alias-label-secondary);transform:rotate(45deg);pointer-events:none;}
 .atc-live{display:inline-flex;align-items:center;gap:6px;font-size:12px;line-height:16px;color:var(--dsw-alias-label-secondary);font-variant-numeric:tabular-nums;}
 .atc-live-dot{width:7px;height:7px;border-radius:50%;background:var(--dsw-alias-state-idle-primary);flex:none;}
 .atc-live-on{background:var(--dsw-alias-state-success-primary);}
@@ -440,15 +562,22 @@ window.__ModuleLoader__.load({
 .atc-icon-btn:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px;}
 .atc-refresh-icon{display:inline-flex;align-items:center;justify-content:center;}
 .atc-spin{animation:atc-rotate 1s linear infinite;}
-.atc-kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;}
-.atc-kpi{display:flex;flex-direction:column;gap:1px;min-width:0;padding:14px 16px 13px;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-layer-1);}
-.atc-kpi-value{font-size:20px;line-height:26px;font-weight:600;font-variant-numeric:tabular-nums;}
-.atc-kpi-label{font-size:12px;line-height:16px;color:var(--dsw-alias-label-secondary);}
-.atc-kpi-context{font-size:12px;line-height:16px;color:var(--dsw-alias-label-secondary);font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.atc-stats{display:flex;flex-wrap:wrap;align-items:center;gap:6px;padding:7px 10px;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-layer-1);}
+.atc-stat{display:inline-flex;align-items:baseline;gap:6px;padding:2px 10px;border-radius:999px;background:var(--dsw-alias-bg-layer-2);font-size:12px;line-height:18px;white-space:nowrap;}
+.atc-stat-value{font-weight:600;font-size:13px;font-variant-numeric:tabular-nums;color:var(--dsw-alias-label-primary);}
+.atc-stat-label{color:var(--dsw-alias-label-secondary);}
+.atc-stat-inprogress .atc-stat-value{color:var(--dsw-alias-brand-primary);}
+.atc-stat-running .atc-stat-value{color:var(--dsw-alias-state-success-primary);}
+.atc-stat-blocked .atc-stat-value{color:var(--dsw-alias-state-warn-primary);}
+.atc-stat-pending .atc-stat-value{color:var(--dsw-alias-label-secondary);}
+.atc-stat-zero .atc-stat-value{color:var(--dsw-alias-label-secondary);font-weight:500;}
 .atc-stale{display:flex;align-items:center;gap:8px;font-size:12px;line-height:18px;color:var(--dsw-alias-state-warn-primary);}
-.atc-status-dot{width:6px;height:6px;border-radius:50%;flex:none;background:currentColor;}
-.atc-stale-dot{background:var(--dsw-alias-state-warn-primary);}
-.atc-notice{display:flex;flex-direction:column;gap:4px;padding:14px 16px;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-layer-1);}
+.atc-dot{width:7px;height:7px;border-radius:50%;background:var(--dsw-alias-state-idle-primary);flex:none;}
+.atc-dot-brand{background:var(--dsw-alias-brand-primary);}
+.atc-dot-success{background:var(--dsw-alias-state-success-primary);}
+.atc-dot-warn{background:var(--dsw-alias-state-warn-primary);}
+.atc-dot-idle{background:var(--dsw-alias-state-idle-primary);}
+.atc-notice{display:flex;flex-direction:column;gap:4px;padding:12px 14px;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-layer-1);}
 .atc-notice-title{font-size:13px;line-height:18px;font-weight:600;}
 .atc-notice-body{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);word-break:break-word;}
 .atc-notice-warn{border-color:color-mix(in srgb,var(--dsw-alias-state-warn-primary) 36%,var(--dsw-alias-border-l1));}
@@ -460,99 +589,108 @@ window.__ModuleLoader__.load({
 .atc-btn{flex:none;padding:6px 12px;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);font-size:12px;line-height:16px;cursor:pointer;}
 .atc-btn:hover{background:var(--dsw-alias-bg-overlay);}
 .atc-btn:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px;}
-.atc-empty{display:flex;flex-direction:column;align-items:center;gap:10px;padding:40px 24px;border:1px solid var(--dsw-alias-border-l1);border-radius:12px;background:var(--dsw-alias-bg-layer-1);text-align:center;}
+.atc-empty{display:flex;flex-direction:column;align-items:center;gap:10px;padding:36px 24px;border:1px solid var(--dsw-alias-border-l1);border-radius:12px;background:var(--dsw-alias-bg-layer-1);text-align:center;}
 .atc-empty-art{color:var(--dsw-alias-label-secondary);opacity:0.85;}
 .atc-empty-title{font-size:14px;line-height:20px;font-weight:600;}
 .atc-empty-body{margin:0;max-width:560px;font-size:12.5px;line-height:19px;color:var(--dsw-alias-label-secondary);}
 .atc-empty-note{margin:0;font-size:12px;line-height:18px;color:var(--dsw-alias-state-warn-primary);}
-.atc-section{display:flex;flex-direction:column;gap:12px;min-width:0;}
-.atc-section-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;flex-wrap:wrap;}
-.atc-section-title{display:flex;align-items:center;gap:8px;margin:0;font-size:13px;line-height:18px;font-weight:600;}
-.atc-section-meta{font-size:12px;line-height:16px;color:var(--dsw-alias-label-secondary);font-variant-numeric:tabular-nums;}
-.atc-count{display:inline-flex;align-items:center;justify-content:center;min-width:18px;padding:1px 6px;border-radius:999px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary);font-size:11px;line-height:16px;font-weight:500;font-variant-numeric:tabular-nums;}
-.atc-team{display:flex;flex-direction:column;gap:20px;min-width:0;}
-.atc-team-plain{padding-top:0;}
-.atc-team:not(.atc-team-plain){padding:18px 20px 20px;border:1px solid var(--dsw-alias-border-l1);border-radius:12px;}
-.atc-team-head{display:flex;flex-direction:column;gap:2px;}
-.atc-team-title{margin:0;font-size:15px;line-height:22px;font-weight:600;}
-.atc-team-meta{font-size:12px;line-height:16px;color:var(--dsw-alias-label-secondary);font-variant-numeric:tabular-nums;}
-.atc-roster-lead{display:grid;grid-template-columns:minmax(0,1fr);}
-.atc-roster-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;}
-.atc-member{display:flex;flex-direction:column;gap:7px;min-width:0;padding:12px 14px 13px;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-layer-1);text-align:left;}
+.atc-teams{display:flex;flex-direction:column;gap:8px;min-width:0;}
+.atc-team{min-width:0;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-layer-1);}
+.atc-team-active{border-color:var(--dsw-alias-border-l2);}
+.atc-team-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;width:100%;padding:8px 12px;border:0;border-radius:10px;background:none;text-align:left;cursor:pointer;}
+.atc-team-head:hover{background:var(--dsw-alias-bg-layer-2);}
+.atc-team-head:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:-2px;}
+.atc-team-lead{min-width:0;font-size:13px;line-height:18px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.atc-team-role{font-size:10px;line-height:14px;letter-spacing:0.05em;text-transform:uppercase;color:var(--dsw-alias-label-secondary);}
+.atc-headstat{font-size:11.5px;line-height:16px;color:var(--dsw-alias-label-secondary);font-variant-numeric:tabular-nums;white-space:nowrap;}
+.atc-headstat-inprogress{color:var(--dsw-alias-brand-primary);font-weight:500;}
+.atc-headstat-zero{color:var(--dsw-alias-label-secondary);font-weight:400;}
+.atc-headstat-blocked{color:var(--dsw-alias-state-warn-primary);}
+.atc-team-last{margin-left:auto;font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary);font-variant-numeric:tabular-nums;white-space:nowrap;}
+.atc-team-error{padding:5px 12px;border-top:1px solid var(--dsw-alias-border-l1);font-size:11.5px;line-height:16px;color:var(--dsw-alias-state-warn-primary);word-break:break-word;}
+.atc-team-body{display:flex;flex-direction:column;gap:10px;padding:2px 12px 12px;}
+.atc-caret{display:inline-block;width:6px;height:6px;border-right:1.5px solid currentColor;border-bottom:1.5px solid currentColor;transform:rotate(-45deg);transition:transform 120ms ease;flex:none;}
+.atc-caret-open{transform:rotate(45deg);}
+.atc-chip{display:inline-flex;align-items:center;max-width:220px;padding:1px 7px;border-radius:999px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary);font-size:11px;line-height:16px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.atc-chip-idle{color:var(--dsw-alias-label-secondary);}
+.atc-chip-owner{color:var(--dsw-alias-label-primary);}
+.atc-project-chip{max-width:180px;color:var(--dsw-alias-label-primary);}
+.atc-roster{display:flex;flex-wrap:wrap;align-items:center;gap:6px;min-width:0;}
+.atc-member{display:inline-flex;align-items:center;gap:6px;max-width:100%;min-width:0;padding:3px 9px 3px 4px;border:1px solid var(--dsw-alias-border-l1);border-radius:999px;background:var(--dsw-alias-bg-base);font-size:12px;line-height:16px;text-align:left;color:var(--dsw-alias-label-primary);}
 .atc-member-clickable{cursor:pointer;}
 .atc-member-clickable:hover{background:var(--dsw-alias-bg-layer-2);border-color:var(--dsw-alias-border-l2);}
 .atc-member-clickable:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px;}
-.atc-member-top{display:flex;align-items:center;gap:10px;min-width:0;}
-.atc-avatar{flex:none;display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;border-radius:50%;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary);font-size:13px;font-weight:600;line-height:1;text-transform:uppercase;}
-.atc-avatar-lead{background:color-mix(in srgb,var(--dsw-alias-brand-primary) 16%,var(--dsw-alias-bg-layer-1));border-color:color-mix(in srgb,var(--dsw-alias-brand-primary) 34%,var(--dsw-alias-border-l1));color:var(--dsw-alias-brand-primary);}
-.atc-member-ident{display:flex;flex-direction:column;gap:1px;min-width:0;flex:1;}
-.atc-member-name{font-size:13px;line-height:18px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-.atc-role{font-size:11px;line-height:14px;letter-spacing:0.04em;color:var(--dsw-alias-label-secondary);text-transform:uppercase;}
-.atc-member-pill{flex:none;margin-left:auto;}
-.atc-status{display:inline-flex;align-items:center;gap:5px;padding:2px 8px;border-radius:999px;font-size:11px;line-height:16px;font-weight:500;white-space:nowrap;}
-.atc-status-running{color:var(--dsw-alias-state-success-primary);background:color-mix(in srgb,var(--dsw-alias-state-success-primary) 12%,transparent);}
-.atc-status-inactive{color:var(--dsw-alias-state-idle-primary);background:color-mix(in srgb,var(--dsw-alias-state-idle-primary) 12%,transparent);}
-.atc-status-provisioning{color:var(--dsw-alias-state-warn-primary);background:color-mix(in srgb,var(--dsw-alias-state-warn-primary) 12%,transparent);}
-.atc-status-failed{color:var(--dsw-alias-state-error-primary);background:color-mix(in srgb,var(--dsw-alias-state-error-primary) 12%,transparent);}
-.atc-member-meta{font-size:12px;line-height:16px;color:var(--dsw-alias-label-secondary);font-variant-numeric:tabular-nums;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-.atc-member-desc{display:-webkit-box;margin:0;font-size:12px;line-height:17px;color:var(--dsw-alias-label-secondary);-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-word;}
-.atc-diagnostics{display:flex;flex-direction:column;gap:2px;}
-.atc-diagnostic{margin:0;font-size:12px;line-height:16px;color:var(--dsw-alias-state-error-primary);word-break:break-word;}
-.atc-board{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;align-items:start;}
-.atc-col{display:flex;flex-direction:column;gap:8px;min-width:0;}
-.atc-col-head{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:0 2px;}
-.atc-col-title{font-size:12px;line-height:16px;font-weight:600;color:var(--dsw-alias-label-secondary);}
-.atc-task{display:flex;flex-direction:column;gap:7px;min-width:0;padding:12px;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-layer-1);}
-.atc-task-completed{opacity:0.62;}
-.atc-task-top{display:flex;align-items:flex-start;gap:8px;min-width:0;}
-.atc-task-dot{flex:none;width:7px;height:7px;margin-top:6px;border-radius:50%;background:var(--dsw-alias-state-idle-primary);}
-.atc-dot-idle{background:var(--dsw-alias-state-idle-primary);}
-.atc-dot-warn{background:var(--dsw-alias-state-warn-primary);}
-.atc-dot-ongoing{background:var(--dsw-alias-brand-primary);}
-.atc-dot-done{background:var(--dsw-alias-state-success-primary);}
-.atc-task-subject{margin:0;font-size:13px;line-height:18px;font-weight:500;word-break:break-word;min-width:0;}
-.atc-task-desc{display:-webkit-box;margin:0;font-size:12px;line-height:17px;color:var(--dsw-alias-label-secondary);-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-word;}
-.atc-task-desc-open{display:block;overflow:visible;-webkit-line-clamp:unset;}
-.atc-task-meta{display:flex;align-items:center;flex-wrap:wrap;gap:6px;min-width:0;}
-.atc-chip{display:inline-flex;align-items:center;max-width:100%;padding:1px 7px;border-radius:999px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary);font-size:11px;line-height:16px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-.atc-chip-owner{color:var(--dsw-alias-label-primary);}
-.atc-task-id{font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary);font-variant-numeric:tabular-nums;}
-.atc-task-warn{font-size:11px;line-height:16px;color:var(--dsw-alias-state-warn-primary);word-break:break-word;}
+.atc-member-idle{opacity:0.66;}
+.atc-member-failed{border-color:color-mix(in srgb,var(--dsw-alias-state-error-primary) 40%,var(--dsw-alias-border-l1));}
+.atc-avatar{display:inline-flex;align-items:center;justify-content:center;flex:none;width:18px;height:18px;border-radius:50%;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary);font-size:10px;line-height:1;font-weight:600;text-transform:uppercase;}
+.atc-avatar-lead{background:color-mix(in srgb,var(--dsw-alias-brand-primary) 16%,var(--dsw-alias-bg-layer-1));color:var(--dsw-alias-brand-primary);}
+.atc-member-name{max-width:160px;font-size:12px;line-height:16px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.atc-member-role{font-size:10px;line-height:12px;letter-spacing:0.05em;text-transform:uppercase;color:var(--dsw-alias-label-secondary);}
+.atc-mstatus{display:inline-flex;align-items:center;gap:4px;font-size:11px;line-height:14px;color:var(--dsw-alias-label-secondary);}
+.atc-mdot{width:6px;height:6px;border-radius:50%;background:currentColor;flex:none;}
+.atc-mstatus-running{color:var(--dsw-alias-state-success-primary);}
+.atc-mstatus-provisioning{color:var(--dsw-alias-state-warn-primary);}
+.atc-mstatus-failed{color:var(--dsw-alias-state-error-primary);}
+.atc-mstatus-inactive{color:var(--dsw-alias-state-idle-primary);}
+.atc-member-more{color:var(--dsw-alias-label-secondary);}
+.atc-tasks{display:flex;flex-direction:column;gap:5px;min-width:0;}
+.atc-subhead{display:flex;align-items:center;gap:6px;margin:0;padding:0;font-size:12px;line-height:16px;font-weight:600;color:var(--dsw-alias-label-secondary);}
+.atc-subhead-inprogress{color:var(--dsw-alias-label-primary);}
+.atc-subhead-title{white-space:nowrap;}
+.atc-subhead-rule{flex:1;height:1px;min-width:8px;background:var(--dsw-alias-border-l1);}
+.atc-subhead-btn{width:100%;padding:2px 0;border:0;background:none;text-align:left;cursor:pointer;border-radius:6px;}
+.atc-subhead-btn:hover{color:var(--dsw-alias-label-primary);}
+.atc-subhead-btn:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px;}
+.atc-subhead-hint{font-size:11px;font-weight:400;color:var(--dsw-alias-label-secondary);white-space:nowrap;}
+.atc-count{display:inline-flex;align-items:center;justify-content:center;min-width:18px;padding:1px 6px;border-radius:999px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary);font-size:11px;line-height:16px;font-weight:500;font-variant-numeric:tabular-nums;}
+.atc-progress{display:flex;flex-direction:column;gap:6px;}
+.atc-icard{display:flex;flex-direction:column;gap:5px;min-width:0;padding:9px 11px;border:1px solid color-mix(in srgb,var(--dsw-alias-brand-primary) 26%,var(--dsw-alias-border-l1));border-left:2px solid var(--dsw-alias-brand-primary);border-radius:8px;background:color-mix(in srgb,var(--dsw-alias-brand-primary) 4%,var(--dsw-alias-bg-layer-1));}
+.atc-icard-top{display:flex;align-items:flex-start;gap:7px;min-width:0;}
+.atc-icard-top .atc-dot{margin-top:5px;}
+.atc-icard-subject{flex:1;min-width:0;margin:0;font-size:13px;line-height:18px;font-weight:600;word-break:break-word;}
+.atc-task-id{max-width:150px;font-size:10.5px;line-height:16px;color:var(--dsw-alias-label-secondary);font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.atc-meta{display:flex;flex-wrap:wrap;align-items:center;gap:5px;min-width:0;}
+.atc-icard-desc{display:-webkit-box;margin:0;font-size:12px;line-height:17px;color:var(--dsw-alias-label-secondary);-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-word;}
+.atc-icard-desc-open{display:block;overflow:visible;-webkit-line-clamp:unset;}
 .atc-expand{align-self:flex-start;padding:0;border:0;background:none;color:var(--dsw-alias-label-secondary);font-size:11px;line-height:16px;cursor:pointer;}
 .atc-expand:hover{color:var(--dsw-alias-label-primary);}
 .atc-expand:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px;border-radius:4px;}
-.atc-empty-msg{padding:12px;border:1px dashed var(--dsw-alias-border-l2);border-radius:10px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);}
-.atc-timeline{display:flex;flex-direction:column;}
-.atc-tl-row{position:relative;display:grid;grid-template-columns:72px 22px minmax(0,1fr);gap:10px;align-items:start;padding:6px 0;}
-.atc-tl-row:not(:last-child)::before{content:"";position:absolute;left:92px;top:26px;bottom:-8px;width:1px;background:var(--dsw-alias-border-l1);}
-.atc-tl-time{font-size:11px;line-height:22px;color:var(--dsw-alias-label-secondary);text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
-.atc-tl-icon{position:relative;z-index:1;display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border:1px solid var(--dsw-alias-border-l1);border-radius:50%;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-secondary);}
-.atc-tl-text{font-size:12.5px;line-height:20px;min-width:0;word-break:break-word;}
-.atc-tl-sub{display:block;font-size:12px;line-height:17px;color:var(--dsw-alias-label-secondary);}
-.atc-skel{display:flex;flex-direction:column;gap:12px;animation:atc-breathe 1.6s ease-in-out infinite;}
-.atc-skel-kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;}
-.atc-skel-block{height:78px;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-layer-1);}
-.atc-skel-panel{height:240px;border:1px solid var(--dsw-alias-border-l1);border-radius:12px;background:var(--dsw-alias-bg-layer-1);}
+.atc-diagnostics{display:flex;flex-direction:column;gap:2px;}
+.atc-diagnostic{margin:0;font-size:11px;line-height:16px;color:var(--dsw-alias-state-error-primary);word-break:break-word;}
+.atc-rows{display:flex;flex-direction:column;margin:0;padding:0;}
+.atc-row{display:flex;align-items:center;gap:8px;min-width:0;padding:3px 2px;font-size:12px;line-height:18px;}
+.atc-row + .atc-row{border-top:1px solid var(--dsw-alias-border-l1);}
+.atc-row-dot{width:6px;height:6px;}
+.atc-row-subject{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.atc-row-owner{flex:none;font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary);white-space:nowrap;}
+.atc-row-mark{flex:none;font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary);white-space:nowrap;}
+.atc-row-mark-warn{color:var(--dsw-alias-state-warn-primary);}
+.atc-rows-dim .atc-row{opacity:0.62;}
+.atc-empty-line{padding:2px;font-size:12px;line-height:17px;color:var(--dsw-alias-label-secondary);}
+.atc-activity{display:flex;flex-direction:column;gap:3px;min-width:0;}
+.atc-minihead{margin:0;font-size:11px;line-height:15px;font-weight:600;color:var(--dsw-alias-label-secondary);}
+.atc-act{display:flex;flex-direction:column;min-width:0;}
+.atc-act-row{display:flex;align-items:baseline;gap:8px;min-width:0;padding:1px 0;font-size:11.5px;line-height:16px;}
+.atc-act-time{flex:none;width:64px;text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--dsw-alias-label-secondary);}
+.atc-act-text{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-secondary);}
+.atc-skel{display:flex;flex-direction:column;gap:10px;animation:atc-breathe 1.6s ease-in-out infinite;}
+.atc-skel-strip{height:36px;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-layer-1);}
+.atc-skel-panel{height:132px;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-layer-1);}
+.atc-skel-panel-short{height:84px;}
 .atc-sr-only{position:absolute;width:1px;height:1px;margin:-1px;padding:0;border:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;}
 @keyframes atc-pulse{0%,100%{opacity:1;}50%{opacity:0.35;}}
 @keyframes atc-rotate{from{transform:rotate(0deg);}to{transform:rotate(360deg);}}
 @keyframes atc-breathe{0%,100%{opacity:1;}50%{opacity:0.55;}}
 @media (max-width:899px){
-.atc-page{padding:16px 16px 40px;gap:16px;}
-.atc-kpis{grid-template-columns:repeat(2,minmax(0,1fr));}
-.atc-skel-kpis{grid-template-columns:repeat(2,minmax(0,1fr));}
-.atc-roster-grid{grid-template-columns:minmax(0,1fr);}
-.atc-board{grid-template-columns:minmax(0,1fr);gap:16px;}
-.atc-team:not(.atc-team-plain){padding:16px;}
-.atc-tl-row{grid-template-columns:64px 22px minmax(0,1fr);gap:8px;}
-.atc-tl-row:not(:last-child)::before{left:82px;}
-.atc-header-side{padding-top:0;}
-}
-@media (max-width:559px){
-.atc-kpis,.atc-skel-kpis{grid-template-columns:minmax(0,1fr);}
+.atc-page{padding:14px 14px 32px;gap:12px;}
+.atc-header-side{width:100%;}
+.atc-select{max-width:100%;}
+.atc-team-last{margin-left:0;}
+.atc-act-time{width:56px;}
 }
 @media (prefers-reduced-motion:reduce){
 .atc-pulse,.atc-spin,.atc-skel{animation:none !important;}
+.atc-caret{transition:none !important;}
 }
 `
 
@@ -605,87 +743,6 @@ window.__ModuleLoader__.load({
       },
         h('path', { d: 'M13.6 8a5.6 5.6 0 1 1-1.7-4' }),
         h('path', { d: 'M13.7 2.2v4h-4' }))
-    }
-
-    function UsersIcon({ size }) {
-      const dimension = svgSize(size, 12)
-      return h('svg', {
-        width: dimension,
-        height: dimension,
-        viewBox: '0 0 16 16',
-        fill: 'none',
-        stroke: 'currentColor',
-        strokeWidth: 1.4,
-        strokeLinecap: 'round',
-        strokeLinejoin: 'round',
-        'aria-hidden': 'true',
-        focusable: 'false',
-        style: { display: 'block' },
-      },
-        h('circle', { cx: 6, cy: 5.8, r: 2.1 }),
-        h('path', { d: 'M2.6 13c0-1.8 1.5-3 3.4-3s3.4 1.2 3.4 3' }),
-        h('circle', { cx: 11.4, cy: 6.4, r: 1.7 }),
-        h('path', { d: 'M10.4 9.5c1.9.1 3.2 1.3 3.2 3' }))
-    }
-
-    function TaskIcon({ size }) {
-      const dimension = svgSize(size, 12)
-      return h('svg', {
-        width: dimension,
-        height: dimension,
-        viewBox: '0 0 16 16',
-        fill: 'none',
-        stroke: 'currentColor',
-        strokeWidth: 1.4,
-        strokeLinecap: 'round',
-        strokeLinejoin: 'round',
-        'aria-hidden': 'true',
-        focusable: 'false',
-        style: { display: 'block' },
-      },
-        h('rect', { x: 2.6, y: 2.6, width: 10.8, height: 10.8, rx: 2.4 }),
-        h('path', { d: 'M5.6 6.2h4.8M5.6 9.6h3.2' }))
-    }
-
-    function CheckIcon({ size }) {
-      const dimension = svgSize(size, 12)
-      return h('svg', {
-        width: dimension,
-        height: dimension,
-        viewBox: '0 0 16 16',
-        fill: 'none',
-        stroke: 'currentColor',
-        strokeWidth: 1.6,
-        strokeLinecap: 'round',
-        strokeLinejoin: 'round',
-        'aria-hidden': 'true',
-        focusable: 'false',
-        style: { display: 'block' },
-      },
-        h('path', { d: 'm3 8.4 3.1 3.1L13 4.8' }))
-    }
-
-    function DotIcon({ size }) {
-      const dimension = svgSize(size, 12)
-      return h('svg', {
-        width: dimension,
-        height: dimension,
-        viewBox: '0 0 16 16',
-        fill: 'currentColor',
-        stroke: 'none',
-        'aria-hidden': 'true',
-        focusable: 'false',
-        style: { display: 'block' },
-      },
-        h('circle', { cx: 8, cy: 8, r: 2.2 }))
-    }
-
-    function ActivityKindIcon({ item, size }) {
-      const kind = asString(item && item.kind)
-      const action = asString(item && item.action)
-      if (kind === 'member') return h(UsersIcon, { size })
-      if (kind === 'task') return action === 'complete' ? h(CheckIcon, { size }) : h(TaskIcon, { size })
-      return h(DotIcon, { size })
     }
 
     function EmptyGraph() {
@@ -862,63 +919,67 @@ window.__ModuleLoader__.load({
     /* Small presentational components                                     */
     /* ------------------------------------------------------------------ */
 
-    function StatusPill({ status, label }) {
-      const tone = hasKey('member.status.' + asString(status)) ? asString(status) : 'inactive'
-      const animated = tone === 'running' || tone === 'provisioning'
-      return h('span', { className: 'atc-status atc-status-' + tone, title: label },
-        h('span', { className: 'atc-status-dot' + (animated ? ' atc-pulse' : ''), 'aria-hidden': 'true' }),
-        h('span', null, label))
-    }
-
-    function KpiCard({ value, label, context }) {
-      return h('div', { className: 'atc-kpi' },
-        h('span', { className: 'atc-kpi-value' }, String(value)),
-        h('span', { className: 'atc-kpi-label' }, label),
-        h('span', { className: 'atc-kpi-context' }, context))
-    }
-
-    function KpiGrid({ data, t }) {
-      const model = kpiModel(data)
-      const cards = [
-        {
-          key: 'members',
-          value: model.members,
-          label: t('kpi.members'),
-          context: t('kpi.membersContext', { running: model.running, total: model.members }),
-        },
-        {
-          key: 'tasks',
-          value: model.tasks,
-          label: t('kpi.tasks'),
-          context: t('kpi.tasksContext', { completed: model.completed, total: model.tasks }),
-        },
+    function StatusStrip({ totals, t }) {
+      const chips = [
         {
           key: 'inProgress',
-          value: model.inProgress,
-          label: t('kpi.inProgress'),
-          context: t('kpi.inProgressContext'),
+          className: 'atc-stat-inprogress',
+          value: String(totals.inProgress),
+          label: t('stat.inProgress'),
+          zero: totals.inProgress === 0,
+        },
+        {
+          key: 'running',
+          className: 'atc-stat-running',
+          value: totals.running + '/' + totals.members,
+          label: t('stat.runningMembers'),
+          zero: totals.running === 0,
         },
         {
           key: 'blocked',
-          value: model.blocked,
-          label: t('kpi.blocked'),
-          context: t('kpi.blockedContext'),
+          className: 'atc-stat-blocked',
+          value: String(totals.blocked),
+          label: t('stat.blocked'),
+          zero: totals.blocked === 0,
+        },
+        {
+          key: 'pending',
+          className: 'atc-stat-pending',
+          value: String(totals.pending),
+          label: t('stat.pending'),
+          zero: totals.pending === 0,
         },
       ]
-      return h('div', { className: 'atc-kpis' }, cards.map((card) => h(KpiCard, {
-        key: card.key,
-        value: card.value,
-        label: card.label,
-        context: card.context,
-      })))
+      return h('div', { className: 'atc-stats' }, chips.map((chip) => h('div', {
+        key: chip.key,
+        className: 'atc-stat ' + chip.className + (chip.zero ? ' atc-stat-zero' : ''),
+      },
+        h('span', { className: 'atc-stat-value' }, chip.value),
+        h('span', { className: 'atc-stat-label' }, chip.label))))
     }
 
-    function Header({ t, anyRunning, refreshing, onRefresh, updatedLabel }) {
+    function Header({ t, totals, projects, projectId, onProjectChange, refreshing, onRefresh, updatedLabel }) {
+      const anyRunning = totals.running > 0
+      const options = asArray(projects).length > 1 ? uniqueProjectOptions(projects, t) : []
       return h('header', { className: 'atc-header' },
         h('div', { className: 'atc-header-main' },
           h('h1', { className: 'atc-title' }, t('title')),
           h('p', { className: 'atc-subtitle' }, t('subtitle'))),
         h('div', { className: 'atc-header-side' },
+          options.length
+            ? h('span', { className: 'atc-filter' },
+              h('select', {
+                className: 'atc-select',
+                value: projectId,
+                title: t('filter.label'),
+                'aria-label': t('filter.label'),
+                onChange: (event) => {
+                  if (event && event.target) onProjectChange(event.target.value)
+                },
+              },
+                h('option', { value: 'all' }, t('filter.all')),
+                options.map((option) => h('option', { key: option.id, value: option.id }, option.label))))
+            : null,
           h('span', { className: 'atc-live', role: 'status', 'aria-live': 'polite' },
             h('span', { className: 'atc-live-dot' + (anyRunning ? ' atc-live-on atc-pulse' : ''), 'aria-hidden': 'true' }),
             h('span', null, t('live', { interval: `${POLL_MS / 1000}s` }))),
@@ -935,8 +996,9 @@ window.__ModuleLoader__.load({
 
     function Skeleton() {
       return h('div', { className: 'atc-skel', 'aria-hidden': 'true' },
-        h('div', { className: 'atc-skel-kpis' }, [0, 1, 2, 3].map((index) => h('div', { key: index, className: 'atc-skel-block' }))),
-        h('div', { className: 'atc-skel-panel' }))
+        h('div', { className: 'atc-skel-strip' }),
+        h('div', { className: 'atc-skel-panel' }),
+        h('div', { className: 'atc-skel-panel atc-skel-panel-short' }))
     }
 
     function ErrorCard({ t, message, onRetry }) {
@@ -949,7 +1011,7 @@ window.__ModuleLoader__.load({
 
     function StaleHint({ t }) {
       return h('div', { className: 'atc-stale', role: 'status' },
-        h('span', { className: 'atc-status-dot atc-stale-dot', 'aria-hidden': 'true' }),
+        h('span', { className: 'atc-dot atc-dot-warn', 'aria-hidden': 'true' }),
         h('span', null, t('stale')))
     }
 
@@ -968,117 +1030,101 @@ window.__ModuleLoader__.load({
     }
 
     /* ------------------------------------------------------------------ */
-    /* Roster                                                              */
+    /* Roster: compact active-first member chips                           */
     /* ------------------------------------------------------------------ */
 
-    function MemberCard({ member, t, onOpen }) {
-      const name = asString(member && member.name) || '—'
-      const role = asString(member && member.role)
-      const status = asString(member && member.status) || 'inactive'
+    function MemberChip({ member, t, onOpen }) {
+      const safe = member && typeof member === 'object' ? member : {}
+      const id = asString(safe.id)
+      const name = asString(safe.name) || '—'
+      const role = asString(safe.role)
+      const status = asString(safe.status) || 'inactive'
+      const tone = memberStatusTone(status)
       const statusLabel = memberStatusLabel(status, t)
+      const roleLabel = memberRoleLabel(role, t)
       const initial = Array.from(name.trim())[0] || '?'
-      const contextLabel = memberContextLabel(member && member.context, t)
-      const metaParts = [
-        asString(member && member.model),
-        contextLabel,
-        asString(member && member.provider),
-      ].filter(Boolean)
-      const metaText = metaParts.length ? metaParts.join(' · ') : '—'
-      const lastActivityAt = asNumber(member && member.lastActivityAt)
-      const eventType = asString(member && member.lastEventType)
-      const activityText = lastActivityAt !== null
-        ? t('member.lastActive', { time: formatRelative(lastActivityAt, t), event: eventType || '—' })
-        : t('member.noActivity')
-      const description = asString(member && member.description)
-      const diagnostics = asArray(member && member.diagnostics).map(asString).filter(Boolean)
-      const roleLabel = role === 'lead' ? t('member.role.lead') : t('member.role.teammate')
-      const clickable = typeof onOpen === 'function' && asString(member && member.id) !== ''
-      const activate = () => openMemberSession(member && member.id)
-      const cardProps = {
-        className: 'atc-member' + (clickable ? ' atc-member-clickable' : ''),
+      const model = asString(safe.model)
+      const provider = asString(safe.provider)
+      const lastActivityAt = asNumber(safe.lastActivityAt)
+      const titleParts = []
+      if (model) titleParts.push(model)
+      if (provider && provider !== model) titleParts.push(provider)
+      if (lastActivityAt !== null) titleParts.push(formatRelative(lastActivityAt, t))
+      const title = titleParts.length ? titleParts.join(' · ') : statusLabel
+      const clickable = typeof onOpen === 'function' && id !== ''
+      const tag = clickable ? 'button' : 'span'
+      const props = {
+        className: 'atc-member'
+          + (clickable ? ' atc-member-clickable' : '')
+          + (tone === 'inactive' ? ' atc-member-idle' : '')
+          + (tone === 'failed' ? ' atc-member-failed' : ''),
+        title,
       }
       if (clickable) {
-        cardProps.role = 'button'
-        cardProps.tabIndex = 0
-        cardProps['aria-label'] = name + ' · ' + statusLabel + ' · ' + t('member.open')
-        cardProps.onClick = activate
-        cardProps.onKeyDown = (event) => {
-          if (event.key === 'Enter' || event.key === ' ' || event.key === 'Spacebar') {
-            event.preventDefault()
-            activate()
-          }
-        }
+        props.type = 'button'
+        props['aria-label'] = [name, roleLabel, statusLabel, t('member.open')].filter(Boolean).join(' · ')
+        props.onClick = () => onOpen(id)
       }
-      return h('article', cardProps,
-        h('div', { className: 'atc-member-top' },
-          h('span', { className: 'atc-avatar' + (role === 'lead' ? ' atc-avatar-lead' : ''), 'aria-hidden': 'true' }, initial),
-          h('div', { className: 'atc-member-ident' },
-            h('span', { className: 'atc-member-name', title: name }, name),
-            h('span', { className: 'atc-role' }, roleLabel)),
-          h('span', { className: 'atc-member-pill' }, h(StatusPill, { status, label: statusLabel }))),
-        h('div', { className: 'atc-member-meta', title: metaText }, metaText),
-        h('div', { className: 'atc-member-meta' }, activityText),
-        description ? h('p', { className: 'atc-member-desc', title: description }, description) : null,
-        diagnostics.length
-          ? h('div', { className: 'atc-diagnostics', 'aria-label': t('member.diagnostics') },
-            diagnostics.map((line, index) => h('p', { className: 'atc-diagnostic', key: String(index) }, line)))
-          : null)
+      return h(tag, props,
+        h('span', { className: 'atc-avatar' + (role === 'lead' ? ' atc-avatar-lead' : ''), 'aria-hidden': 'true' }, initial),
+        h('span', { className: 'atc-member-name' }, name),
+        h('span', { className: 'atc-member-role' }, roleLabel),
+        h('span', { className: 'atc-mstatus atc-mstatus-' + tone },
+          h('span', {
+            className: 'atc-mdot' + ((tone === 'running' || tone === 'provisioning') ? ' atc-pulse' : ''),
+            'aria-hidden': 'true',
+          }),
+          statusLabel))
     }
 
-    function RosterSection({ team, t, onOpen }) {
-      const members = asArray(team && team.members)
-      const lead = members.find((member) => asString(member && member.role) === 'lead') || null
-      const others = members.filter((member) => member !== lead)
-      return h('section', { className: 'atc-section' },
-        h('div', { className: 'atc-section-head' },
-          h('h2', { className: 'atc-section-title' }, t('section.roster'), h('span', { className: 'atc-count' }, String(members.length)))),
-        members.length
-          ? [
-            lead
-              ? h('div', { className: 'atc-roster-lead', key: 'lead' }, h(MemberCard, { member: lead, t, onOpen }))
-              : null,
-            others.length
-              ? h('div', { className: 'atc-roster-grid', key: 'others' },
-                others.map((member, index) => h(MemberCard, {
-                  key: asString(member && member.id) || 'member-' + index,
-                  member,
-                  t,
-                  onOpen,
-                })))
-              : null,
-          ]
-          : h('div', { className: 'atc-empty-msg' }, t('roster.empty')))
+    function Roster({ members, t, onOpen }) {
+      const list = asArray(members)
+      if (list.length === 0) return h('div', { className: 'atc-empty-line' }, t('roster.empty'))
+      const visible = list.slice(0, MEMBER_LIMIT)
+      const hidden = list.length - visible.length
+      return h('div', { className: 'atc-roster', role: 'group', 'aria-label': t('section.roster') },
+        visible.map((member, index) => h(MemberChip, {
+          key: asString(member && member.id) || 'member-' + index,
+          member,
+          t,
+          onOpen,
+        })),
+        hidden > 0 ? h('span', { className: 'atc-chip atc-member-more' }, t('roster.more', { n: hidden })) : null)
     }
 
     /* ------------------------------------------------------------------ */
-    /* Task board                                                          */
+    /* Tasks: in-progress cards first, compact pending/completed rows      */
     /* ------------------------------------------------------------------ */
 
-    function TaskCard({ task, t }) {
+    /**
+     * A task is only "blocked" while it is still pending and the runtime reports
+     * it as not ready. `ready` is derived from completed blockers, and the
+     * runtime retains `blockedBy` after a blocker completes, so the dependency
+     * list alone is not a blocking signal. In-progress tasks always carry
+     * `ready === false` by contract, so they are claimed work, never blocked:
+     * only pending rows may render a blocked marker.
+     */
+    function pendingBlockedMarker(task, t) {
+      const safe = task && typeof task === 'object' ? task : {}
+      if (asString(safe.status) !== 'pending' || safe.ready !== false) return { text: '', blocked: false }
+      const blockedBy = asArray(safe.blockedBy).map(asString).filter(Boolean)
+      return {
+        text: blockedBy.length > 0 ? t('task.blockedBy', { ids: blockedBy.join(', ') }) : t('task.blocked'),
+        blocked: true,
+      }
+    }
+
+    function InProgressCard({ task, t }) {
       const [expanded, setExpanded] = React.useState(false)
       const [clamped, setClamped] = React.useState(false)
       const textRef = React.useRef(null)
-      const description = asString(task && task.description)
-      const status = asString(task && task.status)
-      const completed = status === 'completed'
-      const ready = Boolean(task && task.ready === true)
-      const blockedBy = asArray(task && task.blockedBy).map(asString).filter(Boolean)
-      const writeScopes = asArray(task && task.writeScopes).map(asString).filter(Boolean)
-      const writeWarnings = asArray(task && task.writeScopeWarnings).map(asString).filter(Boolean)
-      const ownerName = asString(task && task.ownerName)
-      const taskId = asString(task && task.id)
-      const statusLabel = taskStatusLabel(status, t)
-      const subject = asString(task && task.subject) || taskId || '—'
-      let dotTone = 'idle'
-      if (completed) dotTone = 'done'
-      else if (status === 'in_progress') dotTone = 'ongoing'
-      else if (status === 'pending' && (!ready || blockedBy.length > 0)) dotTone = 'warn'
-      const dotTitle = [statusLabel, ready ? t('task.ready') : null, blockedBy.length ? t('task.blockedBy', { ids: blockedBy.join(', ') }) : null]
-        .filter(Boolean)
-        .join(' · ')
-      let blockedLine = ''
-      if (blockedBy.length) blockedLine = t('task.blockedBy', { ids: blockedBy.join(', ') })
-      else if (status === 'pending' && !ready) blockedLine = t('task.blocked')
+      const safe = task && typeof task === 'object' ? task : {}
+      const description = asString(safe.description)
+      const subject = asString(safe.subject) || asString(safe.id) || '—'
+      const taskId = asString(safe.id)
+      const ownerName = asString(safe.ownerName)
+      const writeScopes = asArray(safe.writeScopes).map(asString).filter(Boolean)
+      const writeWarnings = asArray(safe.writeScopeWarnings).map(asString).filter(Boolean)
 
       useIsomorphicLayoutEffect(() => {
         if (expanded || !description) {
@@ -1114,73 +1160,126 @@ window.__ModuleLoader__.load({
         }
       }, [description, expanded])
 
-      return h('article', { className: 'atc-task' + (completed ? ' atc-task-completed' : '') },
-        h('div', { className: 'atc-task-top' },
-          h('span', { className: 'atc-task-dot atc-dot-' + dotTone, title: dotTitle, 'aria-hidden': 'true' }),
-          h('h4', { className: 'atc-task-subject' }, subject),
-          h('span', { className: 'atc-sr-only' }, statusLabel)),
-        description
-          ? h('p', { ref: textRef, className: 'atc-task-desc' + (expanded ? ' atc-task-desc-open' : '') }, description)
+      return h('article', { className: 'atc-icard' },
+        h('div', { className: 'atc-icard-top' },
+          h('span', { className: 'atc-dot atc-dot-brand', title: t('status.in_progress'), 'aria-hidden': 'true' }),
+          h('h4', { className: 'atc-icard-subject' }, subject),
+          taskId ? h('span', { className: 'atc-task-id', title: taskId }, taskId) : null),
+        h('div', { className: 'atc-meta' },
+          h('span', { className: 'atc-chip atc-chip-owner', title: t('task.owner', { name: ownerName || t('task.unowned') }) },
+            '@' + (ownerName || t('task.unowned'))),
+          writeScopes.map((scope, index) => h('span', {
+            className: 'atc-chip',
+            key: 'scope-' + index,
+            title: t('task.scopesLabel') + ': ' + scope,
+          }, scope))),
+        writeWarnings.length
+          ? h('div', { className: 'atc-diagnostics' },
+            writeWarnings.map((warning, index) => h('p', { className: 'atc-diagnostic', key: 'warning-' + index }, warning)))
           : null,
-        (clamped || expanded)
+        description
+          ? h('p', { ref: textRef, className: 'atc-icard-desc' + (expanded ? ' atc-icard-desc-open' : '') }, description)
+          : null,
+        description && (clamped || expanded)
           ? h('button', {
             type: 'button',
             className: 'atc-expand',
             'aria-expanded': expanded,
             onClick: () => setExpanded((value) => !value),
           }, t(expanded ? 'task.collapse' : 'task.expand'))
-          : null,
-        h('div', { className: 'atc-task-meta' },
-          h('span', { className: 'atc-chip atc-chip-owner', title: t('task.owner', { name: ownerName || t('task.unowned') }) },
-            '@' + (ownerName || t('task.unowned'))),
-          taskId ? h('span', { className: 'atc-task-id' }, taskId) : null,
-          writeScopes.map((scope, index) => h('span', {
-            className: 'atc-chip',
-            key: 'scope-' + index,
-            title: t('task.scopesLabel') + ': ' + scope,
-          }, scope))),
-        blockedLine ? h('div', { className: 'atc-task-warn' }, blockedLine) : null,
-        writeWarnings.length
-          ? h('div', { className: 'atc-diagnostics' },
-            writeWarnings.map((warning, index) => h('p', { className: 'atc-diagnostic', key: 'warning-' + index }, warning)))
           : null)
     }
 
-    function TaskBoard({ team, t }) {
-      const tasks = asArray(team && team.tasks)
-      const columns = [
-        { key: 'pending', title: t('task.col.pending') },
-        { key: 'in_progress', title: t('task.col.inProgress') },
-        { key: 'completed', title: t('task.col.completed') },
-      ]
-      return h('div', { className: 'atc-board' }, columns.map((column) => {
-        const items = tasks.filter((task) => asString(task && task.status) === column.key)
-        return h('div', { className: 'atc-col', key: column.key },
-          h('div', { className: 'atc-col-head' },
-            h('span', { className: 'atc-col-title' }, column.title),
-            h('span', { className: 'atc-count' }, String(items.length))),
-          items.length
-            ? items.map((task, index) => h(TaskCard, {
-              key: asString(task && task.id) || 'task-' + column.key + '-' + index,
-              task,
-              t,
-            }))
-            : h('div', { className: 'atc-empty-msg' }, t('task.emptyColumn')))
-      }))
+    function PendingRow({ task, t }) {
+      const safe = task && typeof task === 'object' ? task : {}
+      const subject = asString(safe.subject) || asString(safe.id) || '—'
+      const ownerName = asString(safe.ownerName)
+      const description = asString(safe.description)
+      const blocked = pendingBlockedMarker(safe, t)
+      // A ready pending task wins over a retained blockedBy list (completed blockers).
+      const marker = blocked.blocked ? blocked.text : (safe.ready === true ? t('task.ready') : '')
+      const markerWarn = blocked.blocked
+      return h('div', { className: 'atc-row', role: 'listitem', title: description || undefined },
+        h('span', {
+          className: 'atc-dot atc-row-dot' + (markerWarn ? ' atc-dot-warn' : ''),
+          title: t('status.pending'),
+          'aria-hidden': 'true',
+        }),
+        h('span', { className: 'atc-row-subject' }, subject),
+        h('span', { className: 'atc-row-owner' }, ownerName ? '@' + ownerName : t('task.unowned')),
+        marker ? h('span', { className: 'atc-row-mark' + (markerWarn ? ' atc-row-mark-warn' : '') }, marker) : null)
     }
 
-    function TaskSection({ team, t }) {
+    function CompletedRow({ task, t }) {
+      const safe = task && typeof task === 'object' ? task : {}
+      const subject = asString(safe.subject) || asString(safe.id) || '—'
+      const ownerName = asString(safe.ownerName)
+      return h('div', { className: 'atc-row', role: 'listitem' },
+        h('span', { className: 'atc-dot atc-dot-success', title: t('status.completed'), 'aria-hidden': 'true' }),
+        h('span', { className: 'atc-row-subject' }, subject),
+        h('span', { className: 'atc-row-owner' }, ownerName ? '@' + ownerName : t('task.unowned')))
+    }
+
+    function TasksSection({ team, t, completedOpen, onToggleCompleted }) {
       const tasks = asArray(team && team.tasks)
-      return h('section', { className: 'atc-section' },
-        h('div', { className: 'atc-section-head' },
-          h('h2', { className: 'atc-section-title' }, t('section.tasks'), h('span', { className: 'atc-count' }, String(tasks.length)))),
-        tasks.length
-          ? h(TaskBoard, { team, t })
-          : h('div', { className: 'atc-empty-msg' }, t('tasks.empty')))
+      const inProgress = tasks.filter((task) => asString(task && task.status) === 'in_progress')
+      const pending = tasks.filter((task) => asString(task && task.status) === 'pending')
+      const completed = tasks.filter((task) => asString(task && task.status) === 'completed')
+      const blocks = []
+      blocks.push(h('section', { key: 'inprogress', className: 'atc-tasks', 'aria-label': t('section.inProgress') },
+        h('h3', { className: 'atc-subhead atc-subhead-inprogress' },
+          h('span', { className: 'atc-subhead-title' }, t('section.inProgress')),
+          h('span', { className: 'atc-count' }, String(inProgress.length)),
+          h('span', { className: 'atc-subhead-rule', 'aria-hidden': 'true' })),
+        inProgress.length
+          ? h('div', { className: 'atc-progress' }, inProgress.map((task, index) => h(InProgressCard, {
+            key: asString(task && task.id) || 'task-' + index,
+            task,
+            t,
+          })))
+          : h('div', { className: 'atc-empty-line' }, tasks.length === 0 ? t('tasks.empty') : t('tasks.noInProgress'))))
+      if (pending.length > 0) {
+        blocks.push(h('section', { key: 'pending', className: 'atc-tasks', 'aria-label': t('section.pending') },
+          h('h3', { className: 'atc-subhead' },
+            h('span', { className: 'atc-subhead-title' }, t('section.pending')),
+            h('span', { className: 'atc-count' }, String(pending.length)),
+            h('span', { className: 'atc-subhead-rule', 'aria-hidden': 'true' })),
+          h('div', { className: 'atc-rows', role: 'list' }, pending.map((task, index) => h(PendingRow, {
+            key: asString(task && task.id) || 'task-pending-' + index,
+            task,
+            t,
+          })))))
+      }
+      if (completed.length > 0) {
+        blocks.push(h('div', { key: 'completed', className: 'atc-tasks' },
+          h('button', {
+            type: 'button',
+            className: 'atc-subhead atc-subhead-btn',
+            'aria-expanded': completedOpen,
+            'aria-label': t('tasks.completedToggle'),
+            onClick: onToggleCompleted,
+          },
+            h('span', { className: 'atc-caret' + (completedOpen ? ' atc-caret-open' : ''), 'aria-hidden': 'true' }),
+            h('span', { className: 'atc-subhead-title' }, t('tasks.completedCount', { n: completed.length })),
+            h('span', { className: 'atc-subhead-rule', 'aria-hidden': 'true' }),
+            h('span', { className: 'atc-subhead-hint' }, t(completedOpen ? 'team.collapse' : 'team.expand'))),
+          completedOpen
+            ? h('div', {
+              className: 'atc-rows atc-rows-dim',
+              role: 'list',
+              'aria-label': t('section.completed'),
+            }, completed.map((task, index) => h(CompletedRow, {
+              key: asString(task && task.id) || 'task-completed-' + index,
+              task,
+              t,
+            })))
+            : null))
+      }
+      return h(React.Fragment, null, blocks)
     }
 
     /* ------------------------------------------------------------------ */
-    /* Activity timeline                                                   */
+    /* Activity: compact list, latest entries first                        */
     /* ------------------------------------------------------------------ */
 
     function ActivityRow({ item, t }) {
@@ -1195,75 +1294,88 @@ window.__ModuleLoader__.load({
       if (actionText) parts.push(actionText)
       if (memberName) parts.push(memberName)
       const composed = (kind === 'task' || kind === 'member') && parts.length > 0
-      const main = composed ? parts.join(' · ') : (fallbackText || actionText || t('activity.unknown'))
-      const secondary = subject && subject !== main ? subject : (fallbackText && fallbackText !== main ? fallbackText : '')
-      return h('div', { className: 'atc-tl-row' },
-        h('span', { className: 'atc-tl-time', title: relativeTitle(item && item.time) }, formatRelative(item && item.time, t)),
-        h('span', { className: 'atc-tl-icon' }, h(ActivityKindIcon, { item, size: 12 })),
-        h('div', { className: 'atc-tl-text' },
-          main,
-          secondary ? h('span', { className: 'atc-tl-sub' }, secondary) : null))
+      const main = composed ? parts.join(' · ') : (fallbackText || actionText || subject || t('activity.unknown'))
+      const secondary = subject && subject !== main ? subject : ''
+      const absolute = asNumber(item && item.time) !== null ? formatShortDate(item && item.time) : ''
+      const rowTitle = [secondary, absolute].filter(Boolean).join(' · ')
+      return h('div', { className: 'atc-act-row', title: rowTitle || undefined },
+        h('span', { className: 'atc-act-time', title: absolute || undefined }, formatRelative(item && item.time, t)),
+        h('span', { className: 'atc-act-text', title: secondary || undefined }, main))
     }
 
-    function relativeTitle(ts) {
-      const value = asNumber(ts)
-      if (value === null) return ''
-      try {
-        return new Date(value).toLocaleString(languageTag())
-      } catch (error) {
-        return ''
-      }
-    }
-
-    function ActivitySection({ team, t }) {
-      const activity = asArray(team && team.activity).slice(0, ACTIVITY_LIMIT)
-      return h('section', { className: 'atc-section' },
-        h('div', { className: 'atc-section-head' },
-          h('h2', { className: 'atc-section-title' }, t('section.activity'), h('span', { className: 'atc-count' }, String(activity.length)))),
-        activity.length
-          ? h('div', { className: 'atc-timeline' }, activity.map((item, index) => h(ActivityRow, {
+    function ActivityList({ team, t }) {
+      const items = asArray(team && team.activity).slice(0, ACTIVITY_LIMIT)
+      return h('section', { className: 'atc-activity', 'aria-label': t('section.activity') },
+        h('h3', { className: 'atc-minihead' }, t('section.activity')),
+        items.length
+          ? h('div', { className: 'atc-act' }, items.map((item, index) => h(ActivityRow, {
             key: (asString(item && item.seq) || 'activity') + '-' + index,
             item,
             t,
           })))
-          : h('div', { className: 'atc-empty-msg' }, t('activity.empty')))
+          : h('div', { className: 'atc-empty-line' }, t('activity.empty')))
     }
 
     /* ------------------------------------------------------------------ */
-    /* Team block + page                                                   */
+    /* Team section: collapsible header + body                             */
     /* ------------------------------------------------------------------ */
 
-    function TeamBlock({ team, t, multi, onOpen }) {
-      const members = asArray(team && team.members)
-      const lead = members.find((member) => asString(member && member.role) === 'lead') || members[0] || null
-      const leadName = lead ? asString(lead.name) || t('team.unnamed') : t('team.unnamed')
-      const teamId = asString(team && team.id)
-      const shortId = teamId ? teamId.slice(0, 8) : '—'
-      const updated = formatRelative(teamLatestTime(team), t)
-      const errorMessage = asString(team && team.error)
-      const safeTeam = team && typeof team === 'object' ? team : {}
-      const content = [
-        errorMessage
-          ? h('div', { className: 'atc-notice atc-notice-warn', role: 'alert', key: 'error' },
-            h('div', { className: 'atc-notice-body' }, t('team.error', { message: errorMessage })))
-          : null,
-        h(RosterSection, { key: 'roster', team: safeTeam, t, onOpen }),
-        h(TaskSection, { key: 'tasks', team: safeTeam, t }),
-        h(ActivitySection, { key: 'activity', team: safeTeam, t }),
-      ]
-      if (!multi) {
-        return h('section', { className: 'atc-team atc-team-plain' },
-          h('div', { className: 'atc-section-head' },
-            h('h2', { className: 'atc-section-title' }, t('section.team')),
-            h('span', { className: 'atc-section-meta' }, t('team.summary', { name: leadName, id: shortId, updated }))),
-          content)
-      }
-      return h('section', { className: 'atc-team' },
-        h('header', { className: 'atc-team-head' },
-          h('h2', { className: 'atc-team-title' }, leadName),
-          h('span', { className: 'atc-team-meta' }, t('team.idUpdated', { id: shortId, updated }))),
-        content)
+    function TeamSection({ team, index, expanded, completedOpen, onToggle, onToggleCompleted, onOpen, t }) {
+      const safe = team && typeof team === 'object' ? team : {}
+      const counts = teamCounts(safe)
+      const active = teamActiveFromCounts(safe, counts)
+      const project = teamProject(safe)
+      const projectTitle = project ? projectLabel(project, t) : ''
+      const members = sortMembers(asArray(safe.members))
+      const lead = asArray(safe.members).find((member) => asString(member && member.role) === 'lead') || members[0] || null
+      const leadName = lead ? (asString(lead.name) || t('team.unnamed')) : t('team.unnamed')
+      const leadRole = lead ? memberRoleLabel(lead.role, t) : ''
+      const lastActivity = formatRelative(teamLatestTime(safe), t)
+      const errorMessage = asString(safe.error)
+      const memberBusy = counts.running + counts.provisioning > 0
+      let dotClass = 'atc-dot-idle'
+      if (memberBusy) dotClass = 'atc-dot-success atc-pulse'
+      else if (counts.inProgress > 0) dotClass = 'atc-dot-brand'
+      const bodyId = 'atc-team-body-' + index
+      const headingText = projectTitle ? projectTitle + ' · ' + leadName : leadName
+      return h('section', { className: 'atc-team' + (active ? ' atc-team-active' : '') },
+        h('h2', { className: 'atc-sr-only' }, headingText),
+        h('button', {
+          type: 'button',
+          className: 'atc-team-head',
+          'aria-expanded': expanded,
+          'aria-controls': bodyId,
+          title: expanded ? t('team.collapse') : t('team.expand'),
+          onClick: onToggle,
+        },
+          h('span', { className: 'atc-dot ' + dotClass, 'aria-hidden': 'true' }),
+          projectTitle ? h('span', {
+            className: 'atc-chip atc-project-chip',
+            title: project && project.path ? project.path : projectTitle,
+          }, projectTitle) : null,
+          h('span', { className: 'atc-team-lead' }, leadName),
+          leadRole ? h('span', { className: 'atc-team-role' }, leadRole) : null,
+          active ? null : h('span', { className: 'atc-chip atc-chip-idle' }, t('team.idle')),
+          h('span', {
+            className: 'atc-headstat atc-headstat-inprogress' + (counts.inProgress === 0 ? ' atc-headstat-zero' : ''),
+          }, t('team.inProgress', { n: counts.inProgress })),
+          h('span', { className: 'atc-headstat' }, t('team.members', { n: counts.members })),
+          counts.blocked > 0 ? h('span', { className: 'atc-headstat atc-headstat-blocked' }, t('team.blocked', { n: counts.blocked })) : null,
+          h('span', { className: 'atc-team-last' }, lastActivity),
+          h('span', { className: 'atc-caret' + (expanded ? ' atc-caret-open' : ''), 'aria-hidden': 'true' }),
+          h('span', { className: 'atc-sr-only' }, t(expanded ? 'team.collapse' : 'team.expand'))),
+        errorMessage ? h('div', { className: 'atc-team-error', role: 'alert' }, t('team.error', { message: errorMessage })) : null,
+        expanded
+          ? h('div', { className: 'atc-team-body', id: bodyId },
+            h(Roster, { members, t, onOpen }),
+            h(TasksSection, { team: safe, t, completedOpen, onToggleCompleted }),
+            h(ActivityList, { team: safe, t }))
+          : null)
     }
+
+    /* ------------------------------------------------------------------ */
+    /* Page                                                                */
+    /* ------------------------------------------------------------------ */
 
     function Panel() {
       useLocaleRevision()
@@ -1272,15 +1384,33 @@ window.__ModuleLoader__.load({
       const data = snapshot.data
       const phase = snapshot.phase
       const teams = asArray(data && data.teams)
+      const projects = asArray(data && data.projects).filter((project) => project && asString(project.id))
       const unsupported = data ? asString(data.unsupported) : ''
-      const model = data ? kpiModel(data) : null
-      const anyRunning = Boolean(model && model.running > 0)
+
+      const [projectState, setProjectState] = React.useState('all')
+      const [expandedTeams, setExpandedTeams] = React.useState({})
+      const [completedTeams, setCompletedTeams] = React.useState({})
+      const projectId = effectiveProjectId(projectState, projects)
+      const filtered = filterTeams(teams, projectId)
+      const totals = aggregateTeams(filtered)
+
       let updatedLabel = t('neverUpdated')
       if (snapshot.updatedAt) updatedLabel = t('lastUpdated', { time: formatClock(snapshot.updatedAt) })
       else if (phase === 'loading') updatedLabel = t('loading')
       const canOpen = workspaceService() !== null
-      const multi = teams.length > 1
+      const memberOpener = canOpen ? openMemberSession : null
       const busy = snapshot.refreshing || (phase === 'loading' && !data)
+
+      const toggleTeam = (teamKey, activeDefault) => {
+        setExpandedTeams((previous) => {
+          const current = hasOwn(previous, teamKey) ? previous[teamKey] === true : activeDefault
+          return { ...previous, [teamKey]: !current }
+        })
+      }
+      const toggleCompleted = (teamKey) => {
+        setCompletedTeams((previous) => ({ ...previous, [teamKey]: !previous[teamKey] }))
+      }
+
       const body = []
       if (phase === 'loading' && !data) {
         body.push(h(Skeleton, { key: 'skeleton' }))
@@ -1295,29 +1425,42 @@ window.__ModuleLoader__.load({
             message: t('unsupported.body', { message: unsupported }),
           }))
         } else if (data) {
-          body.push(h(KpiGrid, { key: 'kpis', data, t }))
+          body.push(h(StatusStrip, { key: 'stats', totals, t }))
         }
-        if (teams.length === 0) {
+        if (teams.length === 0 || filtered.length === 0) {
           body.push(h(EmptyState, { key: 'empty', t, unsupported }))
         } else {
-          for (let index = 0; index < teams.length; index += 1) {
-            const team = teams[index]
-            body.push(h(TeamBlock, {
-              key: asString(team && team.id) || 'team-' + index,
+          const sections = []
+          for (let index = 0; index < filtered.length; index += 1) {
+            const team = filtered[index]
+            const teamKey = asString(team && team.id) || 'team-' + index
+            const expanded = hasOwn(expandedTeams, teamKey) ? expandedTeams[teamKey] === true : teamActive(team)
+            const completedOpen = hasOwn(completedTeams, teamKey) ? completedTeams[teamKey] === true : false
+            sections.push(h(TeamSection, {
+              key: teamKey,
               team,
+              index,
+              expanded,
+              completedOpen,
+              onToggle: () => toggleTeam(teamKey, teamActive(team)),
+              onToggleCompleted: () => toggleCompleted(teamKey),
+              onOpen: memberOpener,
               t,
-              multi,
-              onOpen: canOpen ? openMemberSession : null,
             }))
           }
+          body.push(h('div', { key: 'teams', className: 'atc-teams' }, sections))
         }
       }
+
       return h('div', { className: 'atc-root' },
         h('style', { 'data-atc-style': 'team-console' }, CSS),
         h('div', { className: 'atc-page' },
           h(Header, {
             t,
-            anyRunning,
+            totals,
+            projects,
+            projectId,
+            onProjectChange: setProjectState,
             refreshing: busy,
             onRefresh: snapshot.refresh,
             updatedLabel,
