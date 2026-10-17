@@ -1,0 +1,32 @@
+# Dependencies
+# This package has no runtime dependencies; node_modules is ignored so a local
+# experiment cannot leak into the repository.
+node_modules/
+
+# Logs
+*.log
+*.tgz
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Test output
+coverage/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# OS metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editors and IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

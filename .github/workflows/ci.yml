@@ -1,0 +1,48 @@
+# Continuous integration for dsh-agent-team-console.
+#
+# The package has zero npm dependencies and no build step, so CI only needs a
+# stock Node.js toolchain: syntax checks, the dependency-free test suite, and a
+# guard for the DSH manifest wiring (package.json, cordis.patch.yml, client.js,
+# locale dictionaries). No `npm install` step is required or wanted.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22', '24']
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Syntax-check the host half
+        run: node --check index.js
+
+      - name: Syntax-check the client bundle
+        run: node --check client.js
+
+      - name: Syntax-check the helper scripts
+        run: |
+          node --check scripts/ci-guard.mjs
+          node --check scripts/verify-live.mjs
+
+      - name: Guard the DSH plugin manifest
+        run: node scripts/ci-guard.mjs
+
+      - name: Run the snapshot tests
+        run: node --test test/snapshot.test.mjs

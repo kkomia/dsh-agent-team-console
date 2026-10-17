@@ -1,0 +1,72 @@
+{
+  "name": "dsh-agent-team-console",
+  "version": "1.0.0",
+  "description": "Read-only Agent Team console for the DeepSeek Harness Web UI: live roster, shared task board, and collaboration activity from one same-origin JSON snapshot route.",
+  "license": "MIT",
+  "author": "kkomia",
+  "type": "module",
+  "main": "index.js",
+  "icon": "icon.svg",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "icon.svg",
+    "locale/*.json",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "docs/"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "agent-teams",
+    "multi-agent",
+    "dashboard",
+    "observability",
+    "task-board",
+    "cordis",
+    "web-ui"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kkomia/dsh-agent-team-console.git"
+  },
+  "homepage": "https://github.com/kkomia/dsh-agent-team-console#readme",
+  "bugs": {
+    "url": "https://github.com/kkomia/dsh-agent-team-console/issues"
+  },
+  "engines": {
+    "node": ">=22.19.0",
+    "dsh": ">=0.2.1-rc.2 <0.3.0-0"
+  },
+  "scripts": {
+    "test": "node --test test/snapshot.test.mjs",
+    "check": "node --check index.js && node --check client.js && node --test test/snapshot.test.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-locale"
+      ]
+    }
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  }
+}
