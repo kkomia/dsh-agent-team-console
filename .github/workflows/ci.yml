@@ -36,9 +36,13 @@ jobs:
       - name: Syntax-check the client bundle
         run: node --check client.js
 
+      - name: Check the top-down graph layout (client)
+        run: node scripts/client-check.mjs
+
       - name: Syntax-check the helper scripts
         run: |
           node --check scripts/ci-guard.mjs
+          node --check scripts/client-check.mjs
           node --check scripts/verify-live.mjs
 
       - name: Guard the DSH plugin manifest

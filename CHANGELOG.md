@@ -7,6 +7,39 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-10-17
+
+Top-down layered flow graph and workspace card grid. UI-only release: the snapshot contract stays at
+version 4 and the host half does not change.
+
+### Added
+
+- Client layout check: `scripts/client-check.mjs` extracts the self-contained
+  `@atc-layout-begin` / `@atc-layout-end` pure layout block from `client.js`, evaluates it with Node, and
+  asserts the layered geometry (root topmost and centred, balanced teammate rows below it, row spacing
+  and overlap bounds, overflow placement, hand-off edge control points between rows, finite message-edge
+  paths, and the empty/single-member cases). CI runs it after the syntax checks.
+
+### Changed
+
+- Replaced the centre-hub/ring interaction graph with a top-down layered data-flow graph: Lead/root at
+  the top centre, teammates in balanced rows below (one row for up to 5; otherwise two balanced rows,
+  larger first; up to 8 shown plus a "+N" overflow node in the last row), downward hand-off edges with a
+  subtle animated dash flow, and curved message arcs that bend upward when both endpoints share a row.
+- Replaced the full-width stacked team sections with a responsive grid of workspace block cards: a
+  collapsed card shows the status dot, workspace name, in-progress badge, Lead, work-ratio donut,
+  rounds/tokens, and work-vs-idle caption; exactly one team expands at a time to a full-row card with the
+  full header, graph, and task summary. The default expanded card is the first active team, and an
+  explicit collapse sticks across the 2-second polls.
+- Updated the READMEs and design notes for the layered graph and workspace card grid; package version
+  bumped to 1.4.0.
+
+### Notes
+
+- No snapshot contract change: the endpoint stays at contract version 4 with the same `edges`, stats,
+  projects, tasks, and activity payloads. This release changes only the client UI and documentation.
+- Everything remains read-only, dependency-free, and local: no new services and no new network calls.
+
 ## [1.3.0] - 2026-10-17
 
 Graph-first UI with pixel-art agents and snapshot contract version 4.

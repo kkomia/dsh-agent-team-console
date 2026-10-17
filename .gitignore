@@ -19,6 +19,9 @@ coverage/
 .env.*
 !.env.example
 
+# Local scratch research (specs, QA reports, logs); never published
+.research/
+
 # OS metadata
 .DS_Store
 Thumbs.db

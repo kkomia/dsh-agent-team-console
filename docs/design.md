@@ -1,19 +1,20 @@
 # Agent Team Console: design notes
 
-Public design notes for the `dsh-agent-team-console` plugin, version 1.3.0 (snapshot contract version
-4). This document describes the architecture, the HTTP snapshot contract, the graph-first UI model, the
-polling lifecycle, the theme and accessibility model, and the current limitations. It is written for
-people who want to understand or extend the plugin; user-facing instructions live in
-[the README](../README.md).
+Public design notes for the `dsh-agent-team-console` plugin, version 1.4.0 (snapshot contract version
+4, unchanged by this release). This document describes the architecture, the HTTP snapshot contract,
+the card-grid and graph-first UI model, the polling lifecycle, the theme and accessibility model, and
+the current limitations. It is written for people who want to understand or extend the plugin;
+user-facing instructions live in [the README](../README.md).
 
 ## 1. Overview and goals
 
 Agent Team Console is a read-only dashboard for Agent Teams in the DeepSeek Harness (DSH) Web UI. It
 adds a sidebar entry and a first-class main panel that shows, for every live team:
 
-- a project-scoped, workspace-first team header with a working-vs-idle donut and team statistics;
-- an animated SVG interaction graph (Lead hub, teammate ring, lead and message edges) whose members are
-  deterministic pixel-art characters;
+- a responsive grid of workspace block cards with one expanded card at a time;
+- a project-scoped expanded header with a working-vs-idle donut and team statistics;
+- a top-down SVG flow graph (Lead at the top centre, teammates in balanced rows below, hand-off and
+  message edges) whose members are deterministic pixel-art characters;
 - a compact task summary with in-progress rows on demand;
 - team and member statistics (rounds, steps, token usage, working / idle / wall time) derived from the
   optional session projections.
@@ -25,7 +26,8 @@ The goals that shaped the design:
 2. **Read-only by construction.** There is no mutation path to audit away: one read-only HTTP route,
    no request bodies, no write calls, no host timers, no filesystem access.
 3. **Graph-first and visual.** The panel shows state as pictures and numbers instead of walls of text:
-   a pixel-art interaction graph, a working-vs-idle donut, and compact stat lines lead the page.
+   a top-down pixel-art flow graph, a workspace card grid, a working-vs-idle donut, and compact stat
+   lines lead the page.
 4. **Stats over transcripts.** Rounds, token usage, and working time come from stock session
    projections, not from rendering tool calls or event text.
 5. **In-progress first.** The panel leads with what is happening now: active teams expand, in-progress
@@ -643,7 +645,7 @@ The hook keeps one state object:
 | State | Trigger | What the panel shows |
 | --- | --- | --- |
 | `loading` with no data | first mount | header + skeleton blocks, no layout jump |
-| `ok` | successful response | status strip, team sections |
+| `ok` | successful response | status strip, workspace cards |
 | `ok` + `stale` | a later poll failed | last data stays visible with a reconnect hint |
 | `error` with no data | first load failed | error card with the message and a retry button |
 | `refreshing` | manual refresh in flight | refresh icon spins; data stays visible |
@@ -665,36 +667,56 @@ The panel renders, in order:
 4. The compact status strip: five chips (in-progress tasks, running members, token usage, blocked
    tasks, pending tasks) computed over the currently filtered teams; zero values are muted rather than
    hidden.
-5. Either the empty state, or one collapsible section per filtered team.
+5. Either the empty state, or a responsive grid of workspace block cards.
 
 The project filter is a native `<select>` with an `aria-label`. It starts at "All projects" and is
 rendered only when `projects[]` has more than one entry. Choosing a project filters the status strip,
-its token total, and the team sections locally, without another request. Duplicate project titles are
+its token total, and the workspace cards locally, without another request. Duplicate project titles are
 disambiguated with a short unique path tail in the option label; the filter is not persisted and
 resets when the panel remounts.
 
-Each team section has an always-visible header and a collapsible body. The header starts with the
-prominent workspace/project name (falling back to "No project"), followed by the Lead name and role, a
-status dot, a working-vs-idle donut with a "work · idle" caption, team rounds, team token totals, an
-in-progress count when non-zero, and an expand/collapse control with `aria-expanded` and
-`aria-controls`. Active teams are expanded by default; idle teams are collapsed by default. Expansion
-state is local React state keyed by team id and persists for the mounted panel.
+The team list is a responsive grid of workspace block cards (`repeat(auto-fill, minmax(232px, 1fr))`,
+single column at 640 px and below). A collapsed card is a `<button>` showing, top to bottom: a status
+dot, the prominent workspace/project name (falling back to "No project"), and an in-progress badge when
+non-zero; the Lead name; a stats row with the working-vs-idle donut, team rounds, and team token
+totals; and a muted work-vs-idle caption. Collapsed cards use the layer-1 surface, a 1 px border, a
+12 px radius, and a 118 px minimum height; hover strengthens the border and active teams use a slightly
+stronger border token.
 
-The body renders, in order:
+At most one card is expanded at a time. The effective key is the user's explicit choice once one has
+been made, otherwise the first active team in the filtered list (or none when no team is active).
+Clicking a collapsed card expands it and collapses the previous one; clicking the expanded header
+collapses it, and an explicit collapse is not overridden by the next poll. If the stored key disappears
+from the filtered list (project change or team removal), the render falls back to the default. The
+expanded card spans the full grid row (`grid-column: 1 / -1`) and renders the full header — workspace
+name, Lead and role, status dot, donut, "work · idle" caption, rounds, token totals, in-progress count,
+and the expand/collapse control with `aria-expanded` / `aria-controls` — followed by the body:
 
-1. An animated SVG interaction graph. The Lead sits in the center hub; the other members are placed
-   on an evenly spaced ring (starting at the top), with the first member as the center when a payload
-   has no Lead. Up to 8 members are rendered, plus a "+N" node for overflow. Lead edges
-   are faint quadratic spokes; message edges are curved chords whose stroke width scales with
-   `weight`, whose opacity scales with recency, and which carry a small dash-flow animation when
-   recent. Every member node is a deterministic pixel-art character drawn from a 10x12 SVG `<rect>`
+1. An animated top-down SVG flow graph. The Lead/root sits at the top centre; teammates are placed in
+   balanced rows below it (a single row for up to 5 teammates, otherwise two balanced rows with the
+   larger row first; when the two rows are equal length, the second row is offset by half a column slot
+   so lower nodes sit between the upper ones). Up to 8 members are drawn; a "+N" node sits at the end
+   of the last row for overflow. Lead-to-teammate hand-off edges are downward cubic curves that flow
+   downward and carry a slow animated dash flow; teammate message edges are quadratic arcs whose stroke
+   width scales with `weight` and opacity with recency, with same-row arcs bending upward so they clear
+   the names. Every member node is a deterministic pixel-art character drawn from a 10x12 SVG `<rect>`
    template with a theme-token palette (the Lead gets the brand outfit and marker), wrapped in the
    working-ratio ring and the token-scaled node radius; under it sit the short name and the tiny stat
    line. A small legend labels the two edge kinds. When the payload has no lead edges, the client
-   derives a structural star from the center member so the graph still renders.
+   derives structural hand-off edges from the root so the graph still renders.
 2. A compact task summary line: in-progress, pending, and blocked counts plus an expand toggle.
    Expanding reveals only the in-progress tasks as one-line rows (subject, owner); pending and
    completed tasks stay as counts.
+
+The graph layout is computed by a self-contained pure block in `client.js` delimited by
+`/* @atc-layout-begin */` and `/* @atc-layout-end */`; it references only `Math`, `Number`, and
+literals, so `scripts/client-check.mjs` can extract it by marker position and evaluate it in Node. The block
+defines the layout constants (108 px horizontal padding, 56 px top padding, 92 px bottom padding,
+380 px minimum width, 108 px column slot, 132 px row gap, single-row maximum of 5, Lead Y of 96 px,
+21 px overflow radius), `layoutTopDown(nodes, hasOverflow)` and `edgePath(from, to, kind)`. The check
+asserts that the root is topmost and centred, teammate rows stay below it with balanced splits and the
+fixed row gap, nodes do not overlap, the overflow node sits in the last row, hand-off edge control
+points stay between the rows, and all geometry is finite including the empty and single-member cases.
 
 Hovering or focusing a node opens a detail card below the graph with the model, rounds, steps, token
 breakdown (uncached input, cache read, cache write, output, total), working and idle time, and the
@@ -702,10 +724,10 @@ member's message in/out summary. Only pending tasks can be ready or blocked: an 
 claimed work and never renders a blocked marker. The activity list is carried by the wire contract but
 is not rendered.
 
-The status strip and the team list both reflect the selected project; the empty state appears when the
-selection has no teams. Relative time thresholds: under 5 seconds is "just now"; under a minute shows
-seconds; then minutes, hours, and days; seven days or more falls back to a short localized date.
-Token counters use compact SI-style formatting (`1.2M`, `34.5k`), and durations use `s`/`m`/`h`/`d`
+The status strip and the workspace card grid both reflect the selected project; the empty state appears
+when the selection has no teams. Relative time thresholds: under 5 seconds is "just now"; under a
+minute shows seconds; then minutes, hours, and days; seven days or more falls back to a short localized
+date. Token counters use compact SI-style formatting (`1.2M`, `34.5k`), and durations use `s`/`m`/`h`/`d`
 forms (localized in Chinese).
 
 ### 7.5 Optional navigation
@@ -728,18 +750,24 @@ borders, and backgrounds come exclusively from DSH alias tokens:
 
 Counts and times use `font-variant-numeric: tabular-nums` so values do not jitter while polling.
 `color-mix()` is used only to derive translucent status tints from those same tokens. The filter,
-status strip, team headers, and task summary are one-line chip/row components with 1 px token
-borders; the graph draws its SVG art exclusively with token fills and strokes.
+status strip, cards, and task summary are compact chip/row/card components with 1 px token borders;
+the graph draws its SVG art exclusively with token fills and strokes.
 
-The graph anatomy is one `<svg>` per team whose viewBox scales with the ring radius: faint quadratic
-lead spokes in the border token, curved message chords in the brand token (thicker with weight,
-stronger when recent), and one node group per member. Node groups render the pixel character as a grid
-of 2 px `<rect>`s (`shape-rendering: crispEdges`) plus the working-ratio arc and status ring; node
-radius is a log scale between 16 and 26 px (plus a small Lead bonus). Status motion is CSS keyframes
-declared in the same `<style>` element: a vertical bob plus a blinking work spark for running, a
-dashed-ring spin plus a soft blink for provisioning, a dash-flow along recent message edges, and no
-motion for idle or failed. The working-vs-idle donut is a 34 px SVG arc in the success token over a
-muted track. No gradients, no drop shadows, no hardcoded colors.
+The workspace grid uses `repeat(auto-fill, minmax(232px, 1fr))` with a 10 px gap and a single column at
+640 px and below. Collapsed cards are layer-1 surfaces with a 12 px radius, a 118 px minimum height,
+and a border that strengthens on hover; the active team uses the stronger border token, and the
+expanded card spans all grid columns.
+
+The graph is one `<svg>` per expanded card whose viewBox comes from the pure layered layout (108 px
+side padding, 132 px row gap), with cubic hand-off edges in the border token carrying a slow
+downward dash flow, and quadratic message arcs in the brand token (thicker with weight, stronger when
+recent). Node groups render the pixel character as a grid of 2 px `<rect>`s
+(`shape-rendering: crispEdges`) plus the working-ratio arc and status ring; node radius is a log scale
+between 16 and 26 px (plus a small Lead bonus). Status motion is CSS keyframes declared in the same
+`<style>` element: a vertical bob plus a blinking work spark for running, a dashed-ring spin plus a
+soft blink for provisioning, and no motion for idle or failed. The hand-off dash flow (and any recent
+message-edge flow) is disabled under reduced motion. The working-vs-idle donut is a 34 px SVG arc in
+the success token over a muted track. No gradients, no drop shadows, no hardcoded colors.
 
 ### 7.7 Accessibility
 
@@ -747,9 +775,12 @@ muted track. No gradients, no drop shadows, no hardcoded colors.
 - The project filter is a native `<select>` with a localized `aria-label`, and the refresh button has
   a localized `aria-label` plus `aria-busy` while loading.
 - Error cards use `role="alert"`; stale and unsupported notices use `role="status"`.
-- Each team header is a button with `aria-expanded` and `aria-controls`; the task-summary toggle is a
-  button with `aria-expanded` and a localized `aria-label`; the in-progress row list is a labeled
-  `role="list"`.
+- Each collapsed workspace card is a `<button>` with a localized accessible name and
+  `aria-expanded`; the expanded card's header is a button with `aria-expanded` and `aria-controls`
+  pointing at the body. Only one card is expanded at a time, so the accordion stays predictable for
+  keyboard and screen-reader users.
+- The task-summary toggle is a button with `aria-expanded` and a localized `aria-label`; the
+  in-progress row list is a labeled `role="list"`.
 - The graph `<svg>` is a labeled `role="group"`; each member node carries a descriptive `aria-label`
   (name, status, rounds, tokens, and incoming/outgoing message counts), is keyboard focusable in member
   order (Lead first), and shows the detail card on focus as well as hover. Clickable nodes are buttons
@@ -757,41 +788,45 @@ muted track. No gradients, no drop shadows, no hardcoded colors.
 - Decorative SVG art and status dots are `aria-hidden`; screen-reader-only text carries
   expand/collapse labels; focus-visible outlines use the brand token.
 - `prefers-reduced-motion: reduce` disables the pulse, spin, skeleton, caret, character bob/spark/blink,
-  edge dash-flow, and donut-arc animations (the status pulse/orbit and work spark are hidden).
+  hand-off and recent-edge dash flows, and donut-arc animations (the status pulse/orbit and work spark
+  are hidden).
 
 ## 8. Visual design
 
 The target is a calm, dense "mission control" page that looks native to the Harness Web UI rather than
-a chat toy. Version 1.1 moved from a card-grid dashboard to an in-progress-first, single-screen
-layout; version 1.2 made the page visual-first; version 1.3 turns each team body into a pixel-art
-interaction graph.
+a chat toy. Version 1.1 moved to an in-progress-first layout, 1.2 made it visual-first, and 1.3 turned
+the team body into a pixel-art graph; version 1.4 adds the workspace card grid and makes the graph flow
+top-down.
 
 - **Page:** scroll container on the base background; content max-width 1120 px centered; 20-24 px
   padding on wide screens; 14 px between page blocks.
 - **Typography:** 13 px body, 12 px meta text, 18 px page title, 15 px workspace name, 600-weight
   section titles, 10-11 px uppercase role tags.
-- **Components:** compact chips, one-line headers, 1 px token borders, 8-10 px radius, layer-1
-  backgrounds; 8-10 px inner gaps.
 - **Status strip:** one row of five inline chips with 13 px semibold tabular values; in-progress uses
   the brand color, running uses success, token usage uses the primary label, blocked uses warning, and
   zero values are muted. Chips wrap on narrow screens.
-- **Team sections:** collapsible cards; the header starts with the prominent workspace name, then the
-  Lead, status dot, 34 px working-vs-idle donut, "work · idle" caption, rounds, token totals,
-  in-progress count, and caret; the active section uses the stronger border token.
-- **Interaction graph:** a center hub plus an evenly spaced member ring, scaled to the member count,
-  with a max rendered height around 520 px. Faint quadratic lead spokes and curved message chords
-  (thicker with weight, brighter when recent, dash-flow when fresh) sit behind the nodes. A small
-  legend above the SVG labels the two edge kinds when present.
+- **Workspace card grid:** `repeat(auto-fill, minmax(232px, 1fr))`, a 10 px gap, and a single column at
+  640 px and below. A collapsed block card (118 px minimum height, 12 px radius, layer-1 surface) shows
+  a status dot plus workspace name plus in-progress badge, the Lead name, a donut + rounds + tokens
+  row, and a muted work-vs-idle caption; hover and active teams strengthen the border. The expanded
+  card spans the whole row and is the only card carrying the header, graph, and task summary.
+- **Layered flow graph:** a top-centre root at 96 px, teammate rows 132 px apart (108 px column slots,
+  108 px side padding, 380 px minimum width), a single row for up to 5 teammates and two balanced rows
+  (larger first) beyond that, up to 8 nodes plus a dashed "+N" overflow node in the last row. Downward
+  cubic hand-off edges flow downward with a slow dash animation; curved message arcs encode weight with
+  thickness and recency with strength, bending upward when both endpoints share a row. A small legend
+  above the SVG labels the two edge kinds.
 - **Pixel-art agents:** deterministic 10x12 characters drawn from 2 px SVG rects with crisp edges;
   theme tokens supply hair, skin, eye, pants, outfit, and accent colors, and the Lead wears the brand
-  outfit plus a marker. The working-ratio ring and token-scaled radius remain, with an 11.5 px name
-  and a 10 px stat line under each node; the "+N" overflow node uses a dashed muted ring.
-- **Task summary:** a single 12 px line with counts and a caret; expanded in-progress rows are compact
-  12 px one-line rows separated by 1 px borders. There is no full task board and no activity list.
+  outfit plus a marker. The working-ratio ring and token-scaled radius remain, with an 11.5 px name and
+  a 10 px stat line under each node.
+- **Task summary:** a single 12 px line with counts and a caret inside the expanded card; expanded
+  in-progress rows are compact 12 px one-line rows separated by 1 px borders. There is no full task
+  board and no activity list.
 
 Responsive behavior: below 900 px the page padding shrinks, the header side takes the full row width,
-the project select and workspace name can stretch, and the detail grid narrows; the graph scales with
-its container width and keeps its ring layout. No element relies on hover to be usable.
+and the detail grid narrows; at 640 px and below the workspace grid becomes a single column. The graph
+scales with its container width and keeps its layered rows. No element relies on hover to be usable.
 
 ## 9. Privacy and security posture
 
@@ -823,16 +858,17 @@ its container width and keeps its ring layout. No element relies on hover to be 
 - The Agent Teams services and their session-event payloads are experimental. Parsing is defensive on
   purpose: a changed payload shape should degrade to a fallback label, not break the panel. When a
   shape change is discovered, update both the parser and the tests.
-- The snapshot contract has an explicit `version`. Package 1.3.0 ships **contract version 4**, which
-  adds `team.edges` (structural `lead` edges and aggregated mailbox `message` edges) to the version 3
-  shape. Version 3 itself added `member.stats` and `team.stats` (rounds, steps, token usage,
+- The snapshot contract has an explicit `version`. Package 1.4.0 is a **UI-only release**: it keeps
+  **contract version 4** exactly as introduced by package 1.3.0 (no host change, no schema change).
+  Version 4 adds `team.edges` (structural `lead` edges and aggregated mailbox `message` edges) to the
+  version 3 shape. Version 3 itself added `member.stats` and `team.stats` (rounds, steps, token usage,
   working / idle / wall time, working ratio, and the member `live` flag). Version 2 added `projects[]`,
   per-team `project` and `active`, per-member and per-task `active`, `counts.idle` and `counts.ready`,
   the extra `totals` counters, and active-first ordering. No version removes or renames existing
   fields; additive fields are safe for existing readers, which should ignore what they do not know.
   Renaming or removing a field requires another contract version bump and a matching client update.
 - Package versions are independent of the contract version (package 1.0.0 shipped contract 1, package
-  1.1.0 shipped contract 2, package 1.2.0 shipped contract 3, package 1.3.0 ships contract 4).
+  1.1.0 shipped contract 2, package 1.2.0 shipped contract 3, packages 1.3.0 and 1.4.0 ship contract 4).
 - Releases follow Semantic Versioning and are documented in [CHANGELOG.md](../CHANGELOG.md) in the
   Keep a Changelog format.
 - The manifest wiring (`dsh.bundle.patch`, `dsh.client.platform`, `dsh.client.immediately`,
@@ -858,23 +894,35 @@ its container width and keeps its ring layout. No element relies on hover to be 
   throws). The suite currently has 50 tests and uses `node:test` and `node:assert/strict` only.
 - **Client checks.** `client.js` is syntax-checked with `node --check`; the manifest guard also proves
   that the embedded Chinese and English dictionaries have identical key sets.
+- **Client layout check.** The top-down layout is a self-contained pure block in `client.js` delimited
+  by `/* @atc-layout-begin */` and `/* @atc-layout-end */`; it references only `Math`, `Number`, and
+  literals. `scripts/client-check.mjs` extracts that block by marker position, evaluates it in Node, and runs
+  26 checks: the exact frozen `LAYOUT` values, the markers appearing once each, the root topmost and
+  centred with zero teammate rows when alone, the single-row boundary at 5 teammates, the balanced
+  3+3 / 4+3 / 4+4 splits (with the second equal row shifted by half a column slot), overflow placement
+  in the last slot, finite geometry for empty and weird inputs, lead-edge cubic control points between
+  the row ys, finite upward-bending same-row message arcs, deterministic edge output, and the static
+  wiring: the graph component calls `layoutTopDown` / `edgePath`, the `atc-lead-flow` keyframes drive
+  the hand-off dash animation and are disabled under reduced motion, and no ring-layout remnants remain.
+  The check is dependency-free and runs in CI after the syntax checks.
 - **Manifest guard.** `scripts/ci-guard.mjs` runs 32 checks over cross-file invariants (manifest
   fields, patch contents, exports, client registration id, locale metadata, and the embedded client
   dictionary key parity) that unit tests do not see.
-- **CI.** The GitHub Actions workflow runs syntax checks, the manifest guard, and the test suite on
-  Node 22 and Node 24. There is no `npm install` step, because there are no dependencies.
+- **CI.** The GitHub Actions workflow runs syntax checks, the manifest guard, the client layout check,
+  and the test suite on Node 22 and Node 24. There is no `npm install` step, because there are no
+  dependencies.
 - **Live verification.** `scripts/verify-live.mjs` is a dependency-free probe that fetches the
   snapshot route of a running server and validates the v4 contract field by field, including the
   graph edges (shape, endpoints, ordering) and the v3 stats/aggregation consistency. It distinguishes
   a contract failure from a 401 admission response.
 - **Manual smoke test.** Install the package into a DSH profile, restart the app, open the panel, and
-  confirm the workspace-first headers, the graph layout and pixel characters, the node animations and
-  detail card (including the message summary), the task summary expand, and both themes. Host log
-  lines are prefixed `[agent-team-console]`.
+  confirm the workspace card grid (one card expanded, default first active team), the layered top-down
+  graph, the pixel characters and node animations, the detail card (including the message summary), the
+  task summary expand, and both themes. Host log lines are prefixed `[agent-team-console]`.
 
 ## 12. Limitations and future work
 
-Known limitations of version 1.3.0:
+Known limitations of version 1.4.0:
 
 - **Polling, not push.** Data is up to roughly 2 seconds old, and the host rebuilds the snapshot for
   each request. Polling stops while the tab is hidden.
@@ -889,11 +937,15 @@ Known limitations of version 1.3.0:
 - **Message edges are bounded.** `message` edges aggregate the newest 1000 events of each member
   session (Lead included) for live `agent-message` deliveries, plus the newest 2000 Lead-session events
   for legacy `team/message/queued` records; older traffic, and messages queued but never delivered, are
-  not represented. Only structural lead links and observed message edges exist; there is no tool-call
-  or task-dependency graph.
+  not represented. Only structural lead hand-off links and observed message edges exist; there is no
+  tool-call or task-dependency graph.
 - **No message content.** Only aggregated message counts and recency drive the graph; peer message
   bodies are not shown.
-- **The graph shows up to 8 members.** Larger teams show a "+N" node instead of every member.
+- **The graph shows up to 8 members.** Larger teams show a "+N" node at the end of the last row instead
+  of every member; teammates use one row for up to 5 and two balanced rows beyond that.
+- **One card expands at a time.** The workspace grid is an accordion: the default expanded card is the
+  first active team, an explicit collapse is remembered across polls, and switching cards collapses the
+  previous one.
 - **Pixel characters are cosmetic.** They are deterministic per member identity and palette-driven;
   they do not encode role, model, or state beyond the Lead outfit and the status ring/motion.
 - **Activity is API-only.** The snapshot still carries the bounded activity list (at most 40 entries
@@ -903,7 +955,7 @@ Known limitations of version 1.3.0:
   and are visible only under the all-projects filter.
 - **The project filter is client-side.** It is not persisted, resets when the panel remounts, and is
   hidden when only one project has live teams.
-- **Collapsed by design.** Idle teams start collapsed and the task summary stays folded until
+- **Collapsed by design.** Idle teams are collapsed cards and the task summary stays folded until
   expanded; the detail is one click away rather than always on screen.
 - **Optional navigation only.** Opening a member session depends on the optional `uiWorkspace`
   service.
