@@ -6,7 +6,7 @@
  *
  *   GET <TEAM_CONSOLE_URL>/api/team-console/snapshot
  *
- * and validates the v3 snapshot contract field by field. Dependency-free: it
+ * and validates the v4 snapshot contract field by field. Dependency-free: it
  * needs only Node.js 22+ (global fetch + AbortController), so it can run on any
  * machine that can reach the Harness Web server.
  *
@@ -20,7 +20,7 @@
  *                     appended, so pass a base URL only.
  *
  * Exit codes:
- *   0  the route is reachable and the snapshot matches the v3 contract
+ *   0  the route is reachable and the snapshot matches the v4 contract
  *   1  the route is unreachable, the response is not JSON, or the contract is
  *      violated
  *   2  the server answered 401/403: DSH connection admission rejected the
@@ -106,7 +106,7 @@ try {
 
 // ---- envelope ---------------------------------------------------------
 note(isObj(body), 'body is an object')
-note(body.version === 3, `version === 3 (got ${JSON.stringify(body.version)})`)
+note(body.version === 4, `version === 4 (got ${JSON.stringify(body.version)})`)
 note(typeof body.ok === 'boolean', 'ok is boolean')
 note(isNum(body.generatedAt), 'generatedAt is a number')
 note(
@@ -269,6 +269,49 @@ for (const [i, team] of teams.entries()) {
       }
     }
   }
+
+  // v4 interaction graph edges: structural lead spokes plus aggregated mailbox traffic.
+  const memberIds = new Set(
+    (team.members || []).map((member) => (isStr(member && member.id) ? member.id : '')),
+  )
+  const leadId = isStr(leads[0] && leads[0].id) ? leads[0].id : ''
+  note(Array.isArray(team.edges), `${tag}.edges is an array`)
+  if (Array.isArray(team.edges)) {
+    const edgeKeys = new Set()
+    let leadEdgeCount = 0
+    let sawMessageEdge = false
+    for (const [j, edge] of team.edges.entries()) {
+      const te = `${tag}.edges[${j}]`
+      note(isObj(edge), `${te} is an object`)
+      note(isStr(edge.from) && memberIds.has(edge.from), `${te}.from is a listed member id`)
+      note(isStr(edge.to) && memberIds.has(edge.to), `${te}.to is a listed member id`)
+      note(edge.kind === 'lead' || edge.kind === 'message', `${te}.kind is lead|message`)
+      note(
+        isNum(edge.weight) && Number.isInteger(edge.weight) && edge.weight >= 1 && edge.weight <= 99,
+        `${te}.weight is an integer in 1..99`,
+      )
+      note(edge.lastAt === null || isNum(edge.lastAt), `${te}.lastAt is number|null`)
+      const key = `${edge.from}->${edge.to}#${edge.kind}`
+      note(!edgeKeys.has(key), `${te} is unique (${key})`)
+      edgeKeys.add(key)
+      if (edge.kind === 'lead') {
+        leadEdgeCount += 1
+        note(sawMessageEdge === false, `${tag}.edges lead edges are ordered before message edges`)
+        note(edge.from === leadId, `${te} lead edge starts at the lead`)
+        note(edge.to !== leadId, `${te} lead edge targets a teammate`)
+        note(edge.weight === 1, `${te} lead edge weight is 1`)
+        note(edge.lastAt === null, `${te} lead edge lastAt is null`)
+      } else if (edge.kind === 'message') {
+        sawMessageEdge = true
+        note(edge.from !== edge.to, `${te} message edge is not a self-edge`)
+      }
+    }
+    note(
+      leadEdgeCount === Math.max(0, (team.members || []).length - 1),
+      `${tag} has one structural lead edge per teammate (got ${leadEdgeCount})`,
+    )
+  }
+
   note(Array.isArray(team.tasks), `${tag}.tasks is an array`)
   for (const [j, t2] of (team.tasks || []).entries()) {
     const tt = `${tag}.tasks[${j}]`
@@ -300,7 +343,7 @@ for (const [i, team] of teams.entries()) {
     note(isStrOrNull(a.status), `${ta}.status string|null`)
   }
   console.log(
-    `${tag} ${team.id}: project=${team.project?.title ?? '(none)'} active=${team.active} lead=${leads[0]?.name} members=${team.members?.length} inProgress=${team.counts?.inProgress} pending=${team.counts?.pending} turns=${team.stats?.turns ?? '-'} tokens=${team.stats?.tokens?.total ?? '-'} workRatio=${team.stats?.workingRatio ?? '-'}`,
+    `${tag} ${team.id}: project=${team.project?.title ?? '(none)'} active=${team.active} lead=${leads[0]?.name} members=${team.members?.length} edges=${team.edges?.length ?? '-'} inProgress=${team.counts?.inProgress} pending=${team.counts?.pending} turns=${team.stats?.turns ?? '-'} tokens=${team.stats?.tokens?.total ?? '-'} workRatio=${team.stats?.workingRatio ?? '-'}`,
   )
   for (const m of team.members || []) {
     console.log(

@@ -1,8 +1,8 @@
 # Agent Team Console
 
 Read-only Agent Teams dashboard for the DeepSeek Harness Web UI (`dsh-agent-team-console`): a
-project-scoped, visual-first live stage for every team, with workspace-first headers, animated agent
-nodes, and rounds / token / working-time statistics in one first-class main panel.
+project-scoped, graph-first live view for every team, with workspace-first headers, a pixel-art agent
+interaction graph, and rounds / token / working-time statistics in one first-class main panel.
 
 English | [中文](README.zh.md)
 
@@ -25,7 +25,8 @@ panel for people who keep a team running for a long stretch:
 - A project filter and a compact status strip covering in-progress tasks, running members, token
   usage, blocked tasks, and pending tasks.
 - Workspace-first team headers with a working-vs-idle donut plus team rounds and token totals.
-- An animated SVG agent stage: one node per member, sized by token usage and ringed by working time.
+- A pixel-art agent interaction graph: Lead at the center, teammates on a ring, lead links and
+  message-traffic chords between them.
 - A one-line task summary with in-progress rows on demand, so the page stays visual instead of a wall
   of text.
 
@@ -47,33 +48,44 @@ external services.
   "未分组" in the Chinese UI), then the Lead name and role, a status dot, a working-vs-idle donut with
   a "work · idle" caption, team rounds, team token totals, an in-progress count when non-zero, and the
   expand/collapse toggle. Active teams expand by default; idle teams stay collapsed.
-- **Animated agent stage.** The text roster is replaced by an SVG stage with one node per member (Lead
-  first and slightly larger; up to 8 shown, then a "+N" overflow node). Node radius scales with token
-  usage, an outer arc shows the working ratio, and the status ring animates: running pulses and
-  orbits, provisioning spins a dashed ring, idle is muted and static, and failed is a static error
-  ring. Under each node sits a tiny "N rounds · X tok" line.
+- **Animated interaction graph.** The linear stage is replaced by an SVG graph: the Lead sits in the
+  center hub and teammates sit on an evenly spaced ring (up to 8, then a "+N" overflow node). Faint
+  curved lead spokes connect the Lead to every teammate, and curved message chords connect members
+  with observed peer messages — live `agent-message` deliveries seen in the member session logs, plus
+  legacy `team/message/queued` records when present — within bounded per-member scans; chord thickness
+  scales with message count, opacity with recency, and a small flow animation shows the direction of
+  recent traffic. A structural star is derived when a payload has no edge data.
+- **Pixel-art agents.** Every member is drawn as a deterministic pixel-art character made of SVG
+  rectangles from a 10x12 template (no external images): the Lead gets a distinct brand-colored outfit
+  and marker, and the theme palette drives outfit accents. The working-ratio ring and token-scaled node
+  radius are still there, with a tiny "N rounds · X tok" line under each node. Status motion: running
+  bobs and shows a working spark, provisioning spins a dashed ring and blinks softly, idle is muted and
+  static, failed keeps a static error ring.
 - **Member details on hover or focus.** Hovering or focusing a node opens a compact detail card with
   the model, rounds, steps, token breakdown (uncached input, cache read, cache write, output, total),
-  and working and idle time. Clicking the node opens the member's session when workspace navigation is
-  available.
+  working and idle time, and the member's message in/out summary. Clicking the node opens the member's
+  session when workspace navigation is available.
 - **Compact task summary.** Each team shows one line with in-progress, pending, and blocked counts and
   a small expand toggle. Expanding shows only the in-progress tasks as one-line rows (subject, owner);
   pending and completed tasks stay counts only. Blocked follows the readiness rule: only a pending
   task with `ready === false` is blocked, and in-progress tasks are never shown as blocked.
 - **Activity stays in the API.** The snapshot still carries the bounded activity list for API
-  consumers, but the v1.2 panel no longer renders it.
+  consumers, but the panel no longer renders it.
+- **Interactive graph data.** When the host can see it, the snapshot also carries the member graph:
+  structural Lead edges plus aggregated message edges from bounded member-session (live deliveries) and
+  Lead-session (legacy records) scans. The panel remains read-only either way.
 - **Multiple teams and projects.** One collapsible section per live team, filtered by project when a
   project is selected.
 - **Honest states.** A loading skeleton on first load, an error card with retry, a "showing the last
   successful snapshot" hint after a failed poll, an unsupported-service notice, and an empty state.
 - **Bilingual.** All visible copy goes through the DSH client locale service, with Chinese and
   English dictionaries kept in sync; the panel follows the host language.
-- **Theme-native.** Colors, borders, and SVG art come only from `--dsw-*` theme tokens, so the panel
-  follows dark and light themes. Stage nodes are keyboard accessible and every animation is disabled
-  under reduced motion.
+- **Theme-native.** Colors, borders, and pixel-art/graph art come only from `--dsw-*` theme tokens, so
+  the panel follows dark and light themes. Graph nodes are keyboard accessible and every animation is
+  disabled under reduced motion.
 - **Polling.** The panel refreshes a same-origin JSON snapshot every 2 seconds while it is mounted and
   the tab is visible, pauses while the tab is hidden, and offers a manual refresh button.
-- **Optional navigation.** When the host exposes `uiWorkspace.openSession`, clicking a stage node
+- **Optional navigation.** When the host exposes `uiWorkspace.openSession`, clicking a graph node
   opens that member's session. When it does not, the panel stays a read-only page.
 
 ## Requirements and compatibility
@@ -86,7 +98,7 @@ external services.
   that service the panel shows a clear "not mounted" notice instead of failing.
 - **Optional session projections.** Rounds, token usage, and working / idle times come from the stock
   DSH `sessionStats` and `tokenUsage` projections. They are optional: without them the panel still
-  renders the stage and shows dashes for statistics.
+  renders the graph and shows dashes for statistics.
 - **A Web-capable profile.** The install examples below use the `desktop` profile; replace `desktop`
   with your own Web profile name (`web`, and so on) if it differs.
 - **No separate Node.js installation is needed to use the plugin.** Node.js 22.19 or newer is only
@@ -137,7 +149,7 @@ keeps polling every 2 seconds while it is visible.
 
 ### Read the header
 
-The header shows the page title and subtitle (a one-line description of the live stage), the project
+The header shows the page title and subtitle (a one-line description of the live graph), the project
 filter when it applies, a live indicator (pulsing while any member is running), the time of the last
 successful update, and a refresh button that spins while a manual refresh is in flight.
 
@@ -167,21 +179,34 @@ donut with a "work · idle" caption, team rounds, team token totals, and an in-p
 non-zero. Clicking the header expands or collapses the team; active teams start expanded and idle
 teams start collapsed. Expansion state is kept while the panel stays mounted.
 
-### Read the agent stage
+### Read the interaction graph
 
-The stage is an animated SVG scene with one node per member, Lead first. Node radius grows with token
-usage (log-scaled against the team's busiest member), and an outer arc shows the member's working
-ratio. Status is visual: a running member has a pulsing ring and an orbiting dot, a provisioning
-member spins a dashed ring, idle members are muted and static, and failed members carry a static error
-ring. Each node shows the member's initial, a short name, and a tiny "N rounds · X tok" line. Teams
-with more than 8 members show a "+N" overflow node. Animations respect the host's reduced-motion
-preference.
+Each team body is an SVG interaction graph. The Lead sits in the center hub and the other members are
+placed on an evenly spaced ring around it; up to 8 members are drawn, and a "+N" node stands in for any
+overflow. A small legend above the graph labels the two edge kinds when they are present:
+
+- **Lead links** (faint curved spokes) connect the Lead to every teammate.
+- **Message links** (curved chords, brand color) connect pairs of members with observed peer messages:
+  live `agent-message` deliveries in each member's session log, plus legacy `team/message/queued`
+  records when present, observed within bounded per-member scans. Thicker chords mean more messages in
+  the observed window, brighter chords are more recent, and recent chords carry a small flow animation
+  showing the direction of the traffic.
+
+Members are drawn as deterministic pixel-art characters made of SVG rectangles (no external images):
+the Lead gets a brand-colored outfit and marker, and each teammate's hair, outfit accent, and
+accessory vary deterministically from their identity. Node radius grows with token usage (log-scaled
+against the team's busiest member), an outer arc shows the working ratio, and a tiny
+"N rounds · X tok" line sits under each node. Status motion: running bobs with a working spark,
+provisioning spins a dashed ring and blinks softly, idle is muted and static, and failed keeps a static
+error ring. If the payload has no edge data, the graph still renders as a structural star from the
+center member. Animations respect the host's reduced-motion preference.
 
 ### Read the node details
 
-Hovering or focusing a node opens a detail card below the stage: model, rounds, steps, the token
-breakdown (uncached input, cache read, cache write, output, total), and working and idle time. The
-card closes when the pointer or focus leaves the node.
+Hovering or focusing a node opens a detail card below the graph: model, rounds, steps, the token
+breakdown (uncached input, cache read, cache write, output, total), working and idle time, and the
+member's message summary (received and sent counts). The card closes when the pointer or focus leaves
+the node.
 
 ### Read the task summary
 
@@ -193,7 +218,7 @@ and shown as blocked. In-progress tasks are claimed work and never show a blocke
 
 ### Open a member session
 
-Click a stage node (or focus it and press Enter or Space) to open that member's session when the host
+Click a graph node (or focus it and press Enter or Space) to open that member's session when the host
 provides workspace navigation. This is an optional convenience: when the service is not available,
 nodes are not clickable.
 
@@ -273,9 +298,13 @@ role, reads the roster and task board for each team, enriches members from a bou
 resolves each team's project, and reads each member's session statistics from the optional session
 projections (`sessionStats` and `tokenUsage`): two bounded projection reads per member, never a
 session-log scan for stats. It computes turns, steps, token buckets, working / idle / wall time, and a
-working ratio, aggregates them per team, and returns one JSON-safe snapshot with contract version 3.
-Teams are ordered active first, then by most recent activity. Unexpected aggregation failures become a
-valid JSON 500 body; unknown routes become a JSON 404 body.
+working ratio, aggregates them per team, and builds each team's interaction graph: structural Lead
+edges plus `message` edges aggregated from two bounded sources — live `agent-message` deliveries in
+each member's session log (the newest 1000 events per listed member, Lead included) and legacy
+`team/message/queued` records in the newest 2000 Lead-session events; weights add, message counts are
+capped at 99, and the newest timestamp is kept. It returns one JSON-safe snapshot with contract
+version 4. Teams are ordered active first, then by most recent activity. Unexpected aggregation
+failures become a valid JSON 500 body; unknown routes become a JSON 404 body.
 
 ### Client half (`client.js`)
 
@@ -288,10 +317,11 @@ Chinese and English locale dictionaries under the `agent-team-console` namespace
 The panel keeps the project selection, the per-team expand state, and the per-team task-summary state
 in local React state (no storage), renders the project filter, the five-chip status strip, and one
 collapsible section per team whose header starts with the workspace name. The body is an animated SVG
-agent stage plus a compact task summary; the wire contract still carries the activity list but the
-panel does not render it. All styles and SVG animations come from one `<style>` element that uses only
-`--dsw-*` tokens, animations are disabled under reduced motion, and polling keeps the same
-2-second, visibility-aware, cleanup-safe behavior as before.
+interaction graph with deterministic pixel-art characters plus a compact task summary; the wire
+contract still carries the activity list but the panel does not render it. All styles, graph art, and
+animations come from one `<style>` element that uses only `--dsw-*` tokens, animations are disabled
+under reduced motion, and polling keeps the same 2-second, visibility-aware, cleanup-safe behavior as
+before.
 
 ## Development
 
@@ -306,12 +336,12 @@ node scripts/ci-guard.mjs
 ```
 
 `npm run check` runs the syntax checks and the test suite, and `npm test` runs the tests alone. The
-suite currently has 39 tests that use only Node built-ins and fake Cordis services; they cover the
-snapshot contract (version 3, project resolution, active ordering, session stats and their optional
-degradation), unknown event shapes, JSON safety, and the 200/404/500 route behavior.
-`scripts/ci-guard.mjs` runs 32 checks over the cross-file DSH wiring (manifest, patch, exports, client
-registration, locale metadata, and the embedded client dictionary key parity), which is the part that
-can break without any unit test failing.
+suite currently has 50 tests that use only Node built-ins and fake Cordis services; they cover the
+snapshot contract (version 4, project resolution, active ordering, session stats and their optional
+degradation, and the interaction-graph edges from both live and legacy sources), unknown event shapes,
+JSON safety, and the 200/404/500 route behavior. `scripts/ci-guard.mjs` runs 32 checks over the
+cross-file DSH wiring (manifest, patch, exports, client registration, locale metadata, and the embedded
+client dictionary key parity), which is the part that can break without any unit test failing.
 
 To try a local change in a live app, install the package into a DSH profile (an absolute local path
 is accepted as an install spec), restart the app, and open the panel. Host log lines are prefixed
@@ -319,7 +349,7 @@ is accepted as an install spec), restart the app, and open the panel. Host log l
 
 To check a running instance's snapshot route from the command line, run
 `TEAM_CONSOLE_URL=http://127.0.0.1:10100 node scripts/verify-live.mjs`. It exits `0` when the route
-is reachable and the v3 contract matches, `1` when the route is unreachable or the contract is
+is reachable and the v4 contract matches, `1` when the route is unreachable or the contract is
 violated, and `2` when admission rejects the request as unauthenticated. A `2` is expected against a
 running DSH desktop app: the route enforces DSH connection admission, so an anonymous command-line
 probe is answered with a JSON 401 before any snapshot logic, while the authenticated browser UI
@@ -359,13 +389,19 @@ control.
   live teams. Teams whose project cannot be resolved appear under "All projects" only and show the
   "No project" label.
 - **Stats are best effort.** Turns, steps, token usage, and working / idle times come from the
-  optional session projections; when they are unavailable the host emits nulls and the stage and
+  optional session projections; when they are unavailable the host emits nulls and the graph and
   detail card show dashes. Stats never trigger a session-log scan.
 - **Activity is API-only.** The snapshot still carries the bounded activity list (at most 40 entries
-  per team) for API consumers, but the v1.2 panel does not render it.
-- **The stage shows up to 8 members.** Larger teams show a "+N" overflow node instead of every member.
-- **No mailbox timeline.** Peer messages are not shown; the official roster and task board are the
-  source of truth.
+  per team) for API consumers, but the panel does not render it.
+- **Message links are bounded.** Message edges aggregate the newest 1000 events of each member's
+  session log (Lead included) for live `agent-message` deliveries, plus the newest 2000 Lead-session
+  events for legacy `team/message/queued` records. Older traffic is not observed; the live source
+  counts only deliveries that reached a member session, while legacy queued records are counted as
+  recorded. Only structural Lead links and observed message edges are represented (no tool-call or
+  task-dependency graph).
+- **The graph shows up to 8 members.** Larger teams show a "+N" node instead of every member.
+- **No message content.** Peer message bodies are not shown; only aggregated message counts between
+  members drive the graph.
 - **Navigation is optional.** Opening a member session depends on the optional `uiWorkspace` service;
   without it the panel remains a pure viewer.
 - **No controls, by design.** There is no spawn, rename, interrupt, claim, complete, or delete action;

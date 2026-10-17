@@ -1,9 +1,9 @@
 # Agent Team Console: design notes
 
-Public design notes for the `dsh-agent-team-console` plugin, version 1.2.0 (snapshot contract version
-3). This document describes the architecture, the HTTP snapshot contract, the visual-first UI model,
-the polling lifecycle, the theme and accessibility model, and the current limitations. It is written
-for people who want to understand or extend the plugin; user-facing instructions live in
+Public design notes for the `dsh-agent-team-console` plugin, version 1.3.0 (snapshot contract version
+4). This document describes the architecture, the HTTP snapshot contract, the graph-first UI model, the
+polling lifecycle, the theme and accessibility model, and the current limitations. It is written for
+people who want to understand or extend the plugin; user-facing instructions live in
 [the README](../README.md).
 
 ## 1. Overview and goals
@@ -12,7 +12,8 @@ Agent Team Console is a read-only dashboard for Agent Teams in the DeepSeek Harn
 adds a sidebar entry and a first-class main panel that shows, for every live team:
 
 - a project-scoped, workspace-first team header with a working-vs-idle donut and team statistics;
-- an animated SVG agent stage: one node per member, scaled by token usage and ringed by working time;
+- an animated SVG interaction graph (Lead hub, teammate ring, lead and message edges) whose members are
+  deterministic pixel-art characters;
 - a compact task summary with in-progress rows on demand;
 - team and member statistics (rounds, steps, token usage, working / idle / wall time) derived from the
   optional session projections.
@@ -23,8 +24,8 @@ The goals that shaped the design:
    services. The host half imports nothing; the client half borrows only React from the host.
 2. **Read-only by construction.** There is no mutation path to audit away: one read-only HTTP route,
    no request bodies, no write calls, no host timers, no filesystem access.
-3. **Visual-first.** The panel shows state as pictures and numbers instead of walls of text: animated
-   stage nodes, a working-vs-idle donut, and compact stat lines lead the page.
+3. **Graph-first and visual.** The panel shows state as pictures and numbers instead of walls of text:
+   a pixel-art interaction graph, a working-vs-idle donut, and compact stat lines lead the page.
 4. **Stats over transcripts.** Rounds, token usage, and working time come from stock session
    projections, not from rendering tool calls or event text.
 5. **In-progress first.** The panel leads with what is happening now: active teams expand, in-progress
@@ -43,7 +44,10 @@ The goals that shaped the design:
 - Replacing the official experimental Agent Teams bundle. This plugin does not provide the Agent
   Teams service, the team tools, or the model-facing behavior.
 - Creating, spawning, renaming, interrupting, claiming, completing, deleting, or reassigning anything.
-- A message or mailbox timeline. Peer messages are not shown.
+- A message-content or mailbox timeline. Peer message bodies are not shown; the graph aggregates
+  message counts only.
+- Tool-call or task-dependency graph edges; only structural lead links and mailbox message traffic are
+  represented.
 - Push-based updates. The panel polls; there is no stream, WebSocket, or projection subscription.
 - A build pipeline, a bundler, a test framework, or runtime dependencies.
 - Anything on the CLI or headless surfaces; this is a Web UI plugin.
@@ -60,7 +64,8 @@ This plugin takes a different route that is fully within the public plugin surfa
    and `sessions`, optionally resolves project/workspace data through the `workspaceRegistry` service,
    optionally reads session statistics through the `sessionProjections` service, and exposes the
    result as one JSON document over a same-origin HTTP route.
-2. The **client half** fetches that document from the browser and renders it as a visual agent stage.
+2. The **client half** fetches that document from the browser and renders it as an interactive member
+   graph.
 
 The pattern is common for small DSH Web plugins: register a route on the Web server, then `fetch` it
 from the same origin. It keeps the client bundle dependency-free, and it makes the read-only
@@ -94,8 +99,8 @@ The two halves are independent files with independent lifecycles:
 
 | Half | File | Loaded by | Responsibility |
 | --- | --- | --- | --- |
-| Host | `index.js` | the DSH host plugin loader (Cordis bundle) | Register the HTTP route; build the version 3 JSON snapshot per request from live services and optional projections. |
-| Client | `client.js` | the DSH Web module loader | Register locale dictionaries, the sidebar entry, and the main panel; poll, filter by project, and render the workspace-first visual stage. |
+| Host | `index.js` | the DSH host plugin loader (Cordis bundle) | Register the HTTP route; build the version 4 JSON snapshot per request from live services and optional projections. |
+| Client | `client.js` | the DSH Web module loader | Register locale dictionaries, the sidebar entry, and the main panel; poll, filter by project, and render the graph-first workspace UI. |
 
 The package manifest wires both halves: `dsh.bundle.patch` points at `cordis.patch.yml`, which
 inserts the bundle row into the profile loader, and `exports["./client"]` points at the browser
@@ -122,11 +127,11 @@ on the locale package.
 
 ### 5.2 Snapshot document
 
-Contract version 3 (`VERSION = 3`). A healthy response is HTTP 200 with:
+Contract version 4 (`VERSION = 4`). A healthy response is HTTP 200 with:
 
 ```jsonc
 {
-  "version": 3,
+  "version": 4,
   "ok": true,
   "generatedAt": 1730000000000,          // Date.now() at the host when the snapshot was built
   "unsupported": null,                    // string when Agent Teams services are absent
@@ -251,6 +256,12 @@ Contract version 3 (`VERSION = 3`). A healthy response is HTTP 200 with:
           "status": "in_progress",        // string | null where derivable
           "text": "task-3 · claim · Review the diff" // required human-readable fallback
         }
+      ],
+      "edges": [
+        // Structural: the Lead owns each teammate.
+        { "from": "session-abc", "to": "session-def", "kind": "lead", "weight": 1, "lastAt": null },
+        // Interaction: peer messages (live agent-message deliveries + legacy queued records).
+        { "from": "session-def", "to": "session-ghi", "kind": "message", "weight": 3, "lastAt": 1730000000000 }
       ]
     }
   ]
@@ -268,8 +279,9 @@ the blocked marker carries the blocker ids when they are known.
 
 Contract version 3 adds `stats` to every listed member and every listed team. Member stats are read
 from the optional `sessionProjections` service and are entirely best effort; team stats are aggregates
-of the member rows. `activity[]` stays in the wire contract for API consumers, but the version 1.2
-client no longer renders it.
+of the member rows. Contract version 4 adds `edges[]` to every listed team: the structural and message
+interaction graph. `activity[]` stays in the wire contract for API consumers, but the client no longer
+renders it.
 
 ### 5.3 Field rules
 
@@ -332,27 +344,46 @@ client no longer renders it.
   3. when there is no workspace entity but there is a cwd, fall back to a synthetic
      `id: "cwd:<cwd>"` project whose `title` is the directory basename and whose `path` is the cwd;
   4. with neither a workspace nor a cwd, set `project: null` and keep the team listed.
+- **Interaction edges.** Every listed team carries `edges[]`, the member interaction graph. Two kinds
+  exist: `lead` and `message`, and no others this release.
+  - `lead` edges are structural: the Lead member id to every other listed member, `weight: 1`,
+    `lastAt: null`. A team with fewer than two members has no lead edges.
+  - `message` edges aggregate observed peer traffic from two bounded session-log sources:
+    - **Live deliveries.** Each listed member session (Lead included) is read once for its newest
+      1000 events. A `user/message` event whose `data.source = { kind: "agent-message", form: "relay",
+      senderSessionId }` is a peer delivery into that member's log, so `senderSessionId -> member id`
+      is one observed edge. This covers lead-to-member, member-to-lead, and member-to-member traffic.
+    - **Legacy records.** The Lead session's newest 2000 events are scanned for
+      `team/message/queued` mailbox events whose `data.teamId` matches the team; their
+      `data.message.senderId -> targetId` pairs count as well.
+    Both sources aggregate into one pair set: `weight` is the total count capped at 99, `lastAt` is the
+    newest event time (or null), and self-edges, malformed payloads, non-string ids, and endpoints that
+    are not current listed members are dropped, so no edge ever dangles. Bounds: at most 2000 Lead
+    events plus 1000 events per listed member per request.
+  - Edges are deduplicated by `(from, to, kind)`. Ordering: `lead` edges first in member order, then
+    `message` edges by weight descending, `lastAt` descending, and `from`/`to` string order. A missing
+    or throwing session degrades only that session's contribution; structural edges always survive.
 - **Unsupported runtime.** When the Agent Teams service is missing, or exists but does not expose
-  the expected methods, the response is still `200`, still `version: 3`, still `ok: true`, with
+  the expected methods, the response is still `200`, still `version: 4`, still `ok: true`, with
   `unsupported` set to a short reason string (for example, `"Agent Teams service is not mounted"`)
   and empty `teams` and `projects` arrays.
 - **Per-team errors.** If reading one team's roster or task board throws, that team is still returned
   with `error` set and whatever data was readable; other teams are unaffected.
-- **Contract evolution.** Version 2 added fields to the version 1 shape; version 3 adds `member.stats`
-  and `team.stats`. Neither version removes or renames existing fields. The bundled client reads every
-  field defensively and keeps local fallbacks (including for `active`, the counters, and the stats), so
-  a partial or older payload still renders.
+- **Contract evolution.** Version 2 added fields to the version 1 shape; version 3 added `member.stats`
+  and `team.stats`; version 4 adds `team.edges`. No version removes or renames existing fields. The
+  bundled client reads every field defensively and keeps local fallbacks (including for `active`, the
+  counters, the stats, and the edges), so a partial or older payload still renders.
 
 ### 5.4 Error responses
 
 - Admission rejection: HTTP 401 with
-  `{ "version": 3, "ok": false, "error": "unauthorized", "teams": [] }`, or HTTP 403 with
+  `{ "version": 4, "ok": false, "error": "unauthorized", "teams": [] }`, or HTTP 403 with
   `"error": "forbidden"`, written before routing when the DSH `connection` service rejects the
   request. Admission runs first, so an unauthenticated request never reaches the 404/500 paths below.
 - Unknown method or path: HTTP 404 with
-  `{ "version": 3, "ok": false, "error": "unknown ...", "teams": [] }`.
+  `{ "version": 4, "ok": false, "error": "unknown ...", "teams": [] }`.
 - Unexpected aggregation failure: HTTP 500 with
-  `{ "version": 3, "ok": false, "error": "...", "teams": [] }`.
+  `{ "version": 4, "ok": false, "error": "...", "teams": [] }`.
 - A response object that cannot be written to is handled defensively; the handler never throws or
   rejects into the Web server.
 
@@ -387,6 +418,8 @@ export function apply(ctx) {
 - The optional `sessionProjections` service is resolved per request and used for the version 3
   member/team statistics. It is not required: when it is missing, or `stateOf(...)` throws for a unit,
   the stats degrade to nulls (see 5.3). The aggregation stays synchronous.
+- Interaction edges require no additional service: `lead` edges are structural, and `message` edges
+  come from one bounded read of the Lead session log (see 6.5).
 - Registration happens inside `ctx.effect(...)`, so unloading the plugin disposes the route.
 - The Agent Teams services are optional and are resolved per request with `ctx.get(...)`, guarded at
   every use. They are never captured at load time, so a service that mounts later is picked up on the
@@ -409,8 +442,9 @@ snapshot builder. `createSnapshot(ctx)` then:
 5. Decides whether the team is listable (more than one member or at least one task). Cheap counts are
    computed first, so the more expensive session reads are skipped for implicit one-person Leads.
 6. Enriches members from the `sessions` service, builds each member's version 3 `stats` from the
-   optional projections, normalizes team activity from the Lead session's event log, and resolves the
-   team's `project` (workspace entity first, cwd fallback, else `null`).
+   optional projections, normalizes team activity from the Lead session's event log, builds the
+   version 4 interaction `edges` (structural lead edges plus the bounded mailbox-message scan), and
+   resolves the team's `project` (workspace entity first, cwd fallback, else `null`).
 7. Aggregates the member stats into `team.stats`, computes the per-team counts and `active` flag,
    plus the `activityAt` sort key (the latest member or activity timestamp). Sorts teams active first
    and then by `activityAt` descending, aggregates `totals` and `projects`, and returns the JSON-safe
@@ -449,7 +483,35 @@ Every read is wrapped in try/catch: a missing service, a session without project
 unit key, or a throwing `stateOf` degrades that member to an all-null stats row and never fails the
 snapshot. The service is resolved once per snapshot and never becomes required.
 
-### 6.5 Activity normalization
+### 6.5 Interaction edges (contract version 4)
+
+`collectTeamEdges` builds each listed team's `edges[]` in two parts, never throwing:
+
+1. **Structural lead edges.** For a team with at least two members, one edge from the Lead member id to
+   every other listed member id, in member order. `weight` is 1 and `lastAt` is null.
+2. **Message edges from two bounded sources.**
+   - *Live `agent-message` deliveries.* `collectLiveMessageEdges` performs one bounded read per listed
+     member session (Lead included) over its newest 1000 events (`MEMBER_MESSAGE_SCAN_EVENTS`). A
+     `user/message` event counts when `data.source.kind === 'agent-message'` and
+     `data.source.senderSessionId` is a non-empty id of a different current member; it yields one
+     observed `senderSessionId -> target member id` edge. Because a delivery lands in the target's
+     log, lead-to-member, member-to-lead, and member-to-member traffic are all covered.
+   - *Legacy `team/message/queued` records.* `collectLegacyMessageEdges` performs one bounded read of
+     the newest 2000 Lead-session events (`MESSAGE_SCAN_EVENTS`) and counts events whose
+     `data.teamId` equals the team, using `data.message.senderId -> data.message.targetId`.
+   `addMessageEdge` merges both sources into one pair map: weights add (cap 99) and `lastAt` keeps the
+   newest observed time. Malformed payloads, self-edges, and unknown endpoints are dropped.
+3. **Dedupe and order.** Pairs are deduped by `(from, to, kind)`. Lead edges come first in member order,
+   followed by message edges sorted by weight descending, `lastAt` descending, then `from`/`to` string
+   order.
+
+A missing, throwing, or snapshot-less member (or Lead) session contributes nothing for that session
+only; structural lead edges always survive, and the whole step is wrapped so an unexpected payload
+yields an empty list instead of failing the snapshot. The graph adds exactly two bounded read kinds:
+the newest 1000 events per listed member session and the newest 2000 Lead-session events, never a
+full-log scan.
+
+### 6.6 Activity normalization
 
 The activity list is built only from the Lead session log, and only from the two event types owned by
 the Agent Teams projection: `team/member` and `team/task`.
@@ -465,13 +527,13 @@ the Agent Teams projection: `team/member` and `team/task`.
 - Every entry carries a `text` fallback built from the id, action, and subject, capped at 200
   characters. The client can always render something even for a future event shape.
 - Events are filtered by team id when the payload carries one, capped to the newest 40 entries, and
-  returned newest first. The version 1.2 client does not render this list; it remains in the wire
-  contract for API consumers.
+  returned newest first. The client does not render this list; it remains in the wire contract for API
+  consumers.
 - To keep long-running Lead sessions cheap, the scan starts with the newest 400 events and expands by
   a factor of 4 until it has at least 12 activity entries, reaches the start of the log, or hits the
   20000-event ceiling.
 
-### 6.6 Project resolution
+### 6.7 Project resolution
 
 Every listed team gets a `project` object or `null`, resolved best effort from two optional sources:
 
@@ -490,7 +552,7 @@ Resolution is wrapped in try/catch and every registry read is guarded separately
 malformed entity or a throwing registry accessor degrades to the fallback instead of failing the
 snapshot.
 
-### 6.7 Defensive parsing and JSON safety
+### 6.8 Defensive parsing and JSON safety
 
 The host treats every service view and event payload as untrusted:
 
@@ -504,7 +566,7 @@ The host treats every service view and event payload as untrusted:
   converts bigints to strings, and breaks cycles with `null`.
 - The route wraps aggregation in try/catch and turns an unexpected failure into a valid JSON 500.
 
-### 6.8 Bounded work and no side effects
+### 6.9 Bounded work and no side effects
 
 - The host keeps no mutable module state, starts no timers, monitors nothing, and touches no files.
 - Every request rebuilds the snapshot from read-only service reads; concurrent requests cannot
@@ -515,6 +577,10 @@ The host treats every service view and event payload as untrusted:
   handful of synchronous entity reads; the request path never awaits or calls async registry APIs.
 - Session stats add exactly two synchronous projection reads per listed member plus one creation-header
   read; they never scan a session log, start timers, or add async work.
+- Interaction edges add bounded session-log reads only: the newest 1000 events of every listed member
+  session (Lead included) for live `agent-message` deliveries, plus the newest 2000 Lead-session events
+  for legacy `team/message/queued` records (fixed windows, never the full log), with no services,
+  timers, or async work.
 
 ## 7. Client half
 
@@ -616,20 +682,25 @@ state is local React state keyed by team id and persists for the mounted panel.
 
 The body renders, in order:
 
-1. An animated SVG agent stage: one node per member, Lead first (slightly larger, brand-tinted ring),
-   up to 8 nodes plus a "+N" overflow node. Node radius scales with token usage (log scale against the
-   team's busiest member); an outer arc shows the working ratio. Status is animated: running gets a
-   pulsing ring and an orbiting dot, provisioning spins a dashed ring, idle is muted and static, and
-   failed is a static error ring. Under each node sit the short name and a tiny stat line
-   (`N rounds · X tok`).
+1. An animated SVG interaction graph. The Lead sits in the center hub; the other members are placed
+   on an evenly spaced ring (starting at the top), with the first member as the center when a payload
+   has no Lead. Up to 8 members are rendered, plus a "+N" node for overflow. Lead edges
+   are faint quadratic spokes; message edges are curved chords whose stroke width scales with
+   `weight`, whose opacity scales with recency, and which carry a small dash-flow animation when
+   recent. Every member node is a deterministic pixel-art character drawn from a 10x12 SVG `<rect>`
+   template with a theme-token palette (the Lead gets the brand outfit and marker), wrapped in the
+   working-ratio ring and the token-scaled node radius; under it sit the short name and the tiny stat
+   line. A small legend labels the two edge kinds. When the payload has no lead edges, the client
+   derives a structural star from the center member so the graph still renders.
 2. A compact task summary line: in-progress, pending, and blocked counts plus an expand toggle.
    Expanding reveals only the in-progress tasks as one-line rows (subject, owner); pending and
    completed tasks stay as counts.
 
-Hovering or focusing a stage node opens a detail card below the stage with the model, rounds, steps,
-token breakdown (uncached input, cache read, cache write, output, total), and working and idle time.
-Only pending tasks can be ready or blocked: an in-progress task is claimed work and never renders a
-blocked marker. The activity list is carried by the wire contract but is not rendered in version 1.2.
+Hovering or focusing a node opens a detail card below the graph with the model, rounds, steps, token
+breakdown (uncached input, cache read, cache write, output, total), working and idle time, and the
+member's message in/out summary. Only pending tasks can be ready or blocked: an in-progress task is
+claimed work and never renders a blocked marker. The activity list is carried by the wire contract but
+is not rendered.
 
 The status strip and the team list both reflect the selected project; the empty state appears when the
 selection has no teams. Relative time thresholds: under 5 seconds is "just now"; under a minute shows
@@ -639,10 +710,10 @@ forms (localized in Chinese).
 
 ### 7.5 Optional navigation
 
-When the optional `uiWorkspace` service exposes `openSession`, clicking a stage node opens that
+When the optional `uiWorkspace` service exposes `openSession`, clicking a graph node opens that
 member's session; nodes are keyboard-focusable buttons in that case. The hover/focus detail card is
 independent of navigation and never blocks it. Navigation is wrapped in try/catch and never affects
-rendering; without the service the stage is a pure read-only view.
+rendering; without the service the graph is a pure read-only view.
 
 ### 7.6 Styling and theming
 
@@ -658,14 +729,17 @@ borders, and backgrounds come exclusively from DSH alias tokens:
 Counts and times use `font-variant-numeric: tabular-nums` so values do not jitter while polling.
 `color-mix()` is used only to derive translucent status tints from those same tokens. The filter,
 status strip, team headers, and task summary are one-line chip/row components with 1 px token
-borders; the stage draws its SVG art exclusively with token fills and strokes.
+borders; the graph draws its SVG art exclusively with token fills and strokes.
 
-The stage anatomy is one `<svg>` per team with a faint connector line, one group per member, and a
-working-ratio arc plus status ring per node; node radius is a log scale between 16 and 26 px (plus a
-small Lead bonus). Status motion is CSS keyframes declared in the same `<style>` element: a running
-pulse plus an orbiting dot, a slow dashed-ring rotation for provisioning, and no motion for idle or
-failed. The working-vs-idle donut is a 34 px SVG arc in the success token over a muted track. No
-gradients, no drop shadows, no hardcoded colors.
+The graph anatomy is one `<svg>` per team whose viewBox scales with the ring radius: faint quadratic
+lead spokes in the border token, curved message chords in the brand token (thicker with weight,
+stronger when recent), and one node group per member. Node groups render the pixel character as a grid
+of 2 px `<rect>`s (`shape-rendering: crispEdges`) plus the working-ratio arc and status ring; node
+radius is a log scale between 16 and 26 px (plus a small Lead bonus). Status motion is CSS keyframes
+declared in the same `<style>` element: a vertical bob plus a blinking work spark for running, a
+dashed-ring spin plus a soft blink for provisioning, a dash-flow along recent message edges, and no
+motion for idle or failed. The working-vs-idle donut is a 34 px SVG arc in the success token over a
+muted track. No gradients, no drop shadows, no hardcoded colors.
 
 ### 7.7 Accessibility
 
@@ -676,19 +750,21 @@ gradients, no drop shadows, no hardcoded colors.
 - Each team header is a button with `aria-expanded` and `aria-controls`; the task-summary toggle is a
   button with `aria-expanded` and a localized `aria-label`; the in-progress row list is a labeled
   `role="list"`.
-- The stage `<svg>` is a labeled `role="group"`; each member node carries a descriptive `aria-label`
-  (name, status, rounds, tokens), is keyboard focusable, and shows the detail card on focus as well as
-  hover. Clickable nodes are buttons activated with Enter or Space.
+- The graph `<svg>` is a labeled `role="group"`; each member node carries a descriptive `aria-label`
+  (name, status, rounds, tokens, and incoming/outgoing message counts), is keyboard focusable in member
+  order (Lead first), and shows the detail card on focus as well as hover. Clickable nodes are buttons
+  activated with Enter or Space. Edges are decorative and `aria-hidden`.
 - Decorative SVG art and status dots are `aria-hidden`; screen-reader-only text carries
   expand/collapse labels; focus-visible outlines use the brand token.
-- `prefers-reduced-motion: reduce` disables the pulse, spin, skeleton, caret, node pulse/orbit/dash,
-  and donut-arc animations (the pulse and orbit rings are hidden entirely).
+- `prefers-reduced-motion: reduce` disables the pulse, spin, skeleton, caret, character bob/spark/blink,
+  edge dash-flow, and donut-arc animations (the status pulse/orbit and work spark are hidden).
 
 ## 8. Visual design
 
 The target is a calm, dense "mission control" page that looks native to the Harness Web UI rather than
 a chat toy. Version 1.1 moved from a card-grid dashboard to an in-progress-first, single-screen
-layout; version 1.2 makes the page visual-first by turning each team body into an agent stage.
+layout; version 1.2 made the page visual-first; version 1.3 turns each team body into a pixel-art
+interaction graph.
 
 - **Page:** scroll container on the base background; content max-width 1120 px centered; 20-24 px
   padding on wide screens; 14 px between page blocks.
@@ -702,16 +778,20 @@ layout; version 1.2 makes the page visual-first by turning each team body into a
 - **Team sections:** collapsible cards; the header starts with the prominent workspace name, then the
   Lead, status dot, 34 px working-vs-idle donut, "work · idle" caption, rounds, token totals,
   in-progress count, and caret; the active section uses the stronger border token.
-- **Agent stage:** a horizontal row of SVG nodes on a shared connector line, scaled to the member
-  count, with a max height around 180 px. Avatars use the member initial; the outer ring shows the
-  working ratio; node size grows with token usage on a log scale; Lead nodes are slightly larger with
-  a brand ring. Each node has a small name and a 10 px stat line under it.
+- **Interaction graph:** a center hub plus an evenly spaced member ring, scaled to the member count,
+  with a max rendered height around 520 px. Faint quadratic lead spokes and curved message chords
+  (thicker with weight, brighter when recent, dash-flow when fresh) sit behind the nodes. A small
+  legend above the SVG labels the two edge kinds when present.
+- **Pixel-art agents:** deterministic 10x12 characters drawn from 2 px SVG rects with crisp edges;
+  theme tokens supply hair, skin, eye, pants, outfit, and accent colors, and the Lead wears the brand
+  outfit plus a marker. The working-ratio ring and token-scaled radius remain, with an 11.5 px name
+  and a 10 px stat line under each node; the "+N" overflow node uses a dashed muted ring.
 - **Task summary:** a single 12 px line with counts and a caret; expanded in-progress rows are compact
   12 px one-line rows separated by 1 px borders. There is no full task board and no activity list.
 
 Responsive behavior: below 900 px the page padding shrinks, the header side takes the full row width,
-the project select and workspace name can stretch, and the detail grid narrows; the stage scales with
-its container width and stays a single row. No element relies on hover to be usable.
+the project select and workspace name can stretch, and the detail grid narrows; the graph scales with
+its container width and keeps its ring layout. No element relies on hover to be usable.
 
 ## 9. Privacy and security posture
 
@@ -727,7 +807,9 @@ its container width and stays a single row. No element relies on hover to be usa
   logic. On a host without that service, the route leaves admission to the deployment's own access
   control. The plugin adds no other authentication layer and no cross-origin access.
 - **Bounded reads.** Session reads are windowed and capped, activity is capped, text fields are capped,
-  stats add two synchronous projection reads per member, and the output is JSON-safe.
+  stats add two synchronous projection reads per member, the v4 message-edge sources read at most the
+  newest 1000 events per listed member session plus the newest 2000 Lead-session events per team, and
+  the output is JSON-safe.
 - **Display-only metadata.** Provider, model, and task text are shown, not evaluated or executed. All
   rendering goes through React text nodes; the panel does not use `dangerouslySetInnerHTML`.
 
@@ -741,16 +823,16 @@ its container width and stays a single row. No element relies on hover to be usa
 - The Agent Teams services and their session-event payloads are experimental. Parsing is defensive on
   purpose: a changed payload shape should degrade to a fallback label, not break the panel. When a
   shape change is discovered, update both the parser and the tests.
-- The snapshot contract has an explicit `version`. Package 1.2.0 ships **contract version 3**, which
-  adds `member.stats` and `team.stats` (rounds, steps, token usage, working / idle / wall time,
-  working ratio, and the member `live` flag) to the version 2 shape. Version 2 itself added
-  `projects[]`, per-team `project` and `active`, per-member and per-task `active`, `counts.idle` and
-  `counts.ready`, the extra `totals` counters, and active-first ordering. Neither version removes or
-  renames existing fields; additive fields are safe for existing readers, which should ignore what
-  they do not know. Renaming or removing a field requires another contract version bump and a matching
-  client update.
+- The snapshot contract has an explicit `version`. Package 1.3.0 ships **contract version 4**, which
+  adds `team.edges` (structural `lead` edges and aggregated mailbox `message` edges) to the version 3
+  shape. Version 3 itself added `member.stats` and `team.stats` (rounds, steps, token usage,
+  working / idle / wall time, working ratio, and the member `live` flag). Version 2 added `projects[]`,
+  per-team `project` and `active`, per-member and per-task `active`, `counts.idle` and `counts.ready`,
+  the extra `totals` counters, and active-first ordering. No version removes or renames existing
+  fields; additive fields are safe for existing readers, which should ignore what they do not know.
+  Renaming or removing a field requires another contract version bump and a matching client update.
 - Package versions are independent of the contract version (package 1.0.0 shipped contract 1, package
-  1.1.0 shipped contract 2, package 1.2.0 ships contract 3).
+  1.1.0 shipped contract 2, package 1.2.0 shipped contract 3, package 1.3.0 ships contract 4).
 - Releases follow Semantic Versioning and are documented in [CHANGELOG.md](../CHANGELOG.md) in the
   Keep a Changelog format.
 - The manifest wiring (`dsh.bundle.patch`, `dsh.client.platform`, `dsh.client.immediately`,
@@ -767,9 +849,13 @@ its container width and stays a single row. No element relies on hover to be usa
   and component `active` flags, `projects` aggregation and ordering, active-first team ordering, the
   version 3 session stats (projection mapping, token sums, work/idle/ratio math and clamping, the
   `live` flag, missing/throwing projections, missing `createdAt`, zero usage, and team aggregation
-  with mixed nulls), unknown event shapes, JSON safety, text caps, version 3 route behavior
-  (200/404/500), and connection admission (401, 403, and fail-closed when the admission check throws).
-  The suite currently has 39 tests and uses `node:test` and `node:assert/strict` only.
+  with mixed nulls), the version 4 interaction edges (structural lead edges; live `agent-message`
+  aggregation in both directions across member logs; legacy `team/message/queued` aggregation; weights
+  added across both sources; the weight cap; self/unknown-endpoint and malformed-source drops; dedupe
+  and ordering; the per-member 1000-event and Lead 2000-event bounds; and structural-only degradation
+  when sessions are missing/throwing), unknown event shapes, JSON safety, text caps, version 4 route
+  behavior (200/404/500), and connection admission (401, 403, and fail-closed when the admission check
+  throws). The suite currently has 50 tests and uses `node:test` and `node:assert/strict` only.
 - **Client checks.** `client.js` is syntax-checked with `node --check`; the manifest guard also proves
   that the embedded Chinese and English dictionaries have identical key sets.
 - **Manifest guard.** `scripts/ci-guard.mjs` runs 32 checks over cross-file invariants (manifest
@@ -778,17 +864,17 @@ its container width and stays a single row. No element relies on hover to be usa
 - **CI.** The GitHub Actions workflow runs syntax checks, the manifest guard, and the test suite on
   Node 22 and Node 24. There is no `npm install` step, because there are no dependencies.
 - **Live verification.** `scripts/verify-live.mjs` is a dependency-free probe that fetches the
-  snapshot route of a running server and validates the v3 contract field by field, including the new
-  stats shape and team aggregation consistency. It distinguishes a contract failure from a 401
-  admission response.
+  snapshot route of a running server and validates the v4 contract field by field, including the
+  graph edges (shape, endpoints, ordering) and the v3 stats/aggregation consistency. It distinguishes
+  a contract failure from a 401 admission response.
 - **Manual smoke test.** Install the package into a DSH profile, restart the app, open the panel, and
-  confirm the workspace-first headers, the stage animations and node sizing, the hover/focus detail
-  card, the task summary expand, and both themes. Host log lines are prefixed
-  `[agent-team-console]`.
+  confirm the workspace-first headers, the graph layout and pixel characters, the node animations and
+  detail card (including the message summary), the task summary expand, and both themes. Host log
+  lines are prefixed `[agent-team-console]`.
 
 ## 12. Limitations and future work
 
-Known limitations of version 1.2.0:
+Known limitations of version 1.3.0:
 
 - **Polling, not push.** Data is up to roughly 2 seconds old, and the host rebuilds the snapshot for
   each request. Polling stops while the tab is hidden.
@@ -796,13 +882,22 @@ Known limitations of version 1.2.0:
 - **Only real teams are listed.** Implicit one-person Lead sessions are filtered out.
 - **Stats are best effort.** Turns, steps, token usage, and working / idle / wall time come from the
   optional `sessionProjections` service (`sessionStats` and `tokenUsage`). When the service or a
-  projection unit is unavailable, member and team stats contain nulls, and the stage and detail card
+  projection unit is unavailable, member and team stats contain nulls, and the graph and detail card
   show dashes. Stats never scan the session log and never block the snapshot.
 - **Team stats are aggregates.** A team stat is the null-safe sum of its members' known values; it is
   not an independent measurement, and a mixed roster can therefore leave some fields unknown.
+- **Message edges are bounded.** `message` edges aggregate the newest 1000 events of each member
+  session (Lead included) for live `agent-message` deliveries, plus the newest 2000 Lead-session events
+  for legacy `team/message/queued` records; older traffic, and messages queued but never delivered, are
+  not represented. Only structural lead links and observed message edges exist; there is no tool-call
+  or task-dependency graph.
+- **No message content.** Only aggregated message counts and recency drive the graph; peer message
+  bodies are not shown.
+- **The graph shows up to 8 members.** Larger teams show a "+N" node instead of every member.
+- **Pixel characters are cosmetic.** They are deterministic per member identity and palette-driven;
+  they do not encode role, model, or state beyond the Lead outfit and the status ring/motion.
 - **Activity is API-only.** The snapshot still carries the bounded activity list (at most 40 entries
-  per team) for API consumers, but the version 1.2 panel does not render it.
-- **The stage shows up to 8 members.** Larger teams show a "+N" overflow node instead of every member.
+  per team) for API consumers, but the panel does not render it.
 - **Project resolution is best effort.** Without the optional `workspaceRegistry` service the host
   falls back to the Lead session cwd; teams with neither a workspace nor a cwd show `project: null`
   and are visible only under the all-projects filter.
@@ -810,7 +905,6 @@ Known limitations of version 1.2.0:
   hidden when only one project has live teams.
 - **Collapsed by design.** Idle teams start collapsed and the task summary stays folded until
   expanded; the detail is one click away rather than always on screen.
-- **No mailbox timeline, no member messages.**
 - **Optional navigation only.** Opening a member session depends on the optional `uiWorkspace`
   service.
 - **Fallback labels for unknown shapes.** A future event shape may show as a generic update label
@@ -820,6 +914,6 @@ Known limitations of version 1.2.0:
   range `<0.3.0-0` excludes 0.3.0 prereleases and later until they are tested.
 
 Possible future work that stays inside the project's constraints: more projection-backed statistics,
-richer stage interactions, additional read-only grouping, and more granular project context. Anything
+richer graph interactions, additional read-only grouping, and more granular project context. Anything
 that requires mutations, push subscriptions, external services, persistence, or runtime dependencies
 is out of scope by design.

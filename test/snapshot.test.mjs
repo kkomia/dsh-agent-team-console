@@ -147,6 +147,42 @@ function taskEvent(seq, time, task) {
   return { type: 'team/task', seq, time, data: { version: 2, teamId: ROOT_ID, task } }
 }
 
+/** Durable mailbox delivery fake: `data.message` carries the sender/target ids. */
+function messageEvent(
+  seq,
+  time,
+  { id = `message-${seq}`, teamId = ROOT_ID, senderId, senderName = null, targetId, content = 'hello' } = {},
+) {
+  return {
+    type: 'team/message/queued',
+    seq,
+    time,
+    data: { version: 1, teamId, message: { id, senderId, senderName, targetId, content } },
+  }
+}
+
+/**
+ * Live agent-message fake as stored in the TARGET member's session log:
+ * a `user/message` event whose `data.source` marks relayed peer traffic.
+ */
+function agentMessageEvent(
+  seq,
+  time,
+  { id = `agent-message-${seq}`, senderSessionId, kind = 'agent-message', form = 'relay', content = 'relay message' } = {},
+) {
+  return {
+    type: 'user/message',
+    seq,
+    time,
+    data: { role: 'user', id, source: { kind, form, senderSessionId }, content },
+  }
+}
+
+/** TeamMemberView fake for teammates (fixtures add the Lead row themselves). */
+function teammateView(id, status = 'running') {
+  return { id, name: id.replace(/^session-/, ''), role: 'teammate', status, description: id, diagnostics: [] }
+}
+
 /** TeamTaskView fake with two-state `ready` (the only field the contract inspects). */
 function taskView({ id, status = 'pending', ready = false, blockedBy = [], subject = id, ownerName = null } = {}) {
   return {
@@ -319,10 +355,10 @@ function buildTeamServices({ withSessions = true, cwd = ROOT_CWD, workspaces = n
 }
 
 /**
- * Smaller team fixture for the focused v2/v3 tests: Lead + teammate(s) + tasks,
- * one task event to anchor `activityAt`, optional creation header (cwd +
- * createdAt), fake workspace registry and fake session projections. Reuses the
- * same session/workspace fakes as above.
+ * Smaller team fixture for the focused v2/v3/v4 tests: Lead + teammate(s) +
+ * tasks, one task event to anchor `activityAt`, optional creation header (cwd +
+ * createdAt), fake workspace registry, fake session projections, a Lead-log
+ * event override and per-member session logs. Reuses the same fakes as above.
  */
 function buildSimpleTeam({
   teamId = ROOT_ID,
@@ -336,6 +372,8 @@ function buildSimpleTeam({
   workspaces = null,
   withSessions = true,
   projections = null,
+  rootEvents: rootEventsOverride = null,
+  memberEvents = null,
 } = {}) {
   const rootAgent = { id: teamId, status: rootStatus }
   const teammateViews =
@@ -343,7 +381,7 @@ function buildSimpleTeam({
       ? members
       : [{ id: `${teamId}-helper`, name: 'helper', role: 'teammate', status: memberStatus, description: 'h', diagnostics: [] }]
   const memberViews = [{ id: teamId, name: 'lead', role: 'lead', status: rootStatus, diagnostics: [] }, ...teammateViews]
-  const rootEvents = [
+  const defaultRootEvents = [
     {
       type: 'team/task',
       seq: 1,
@@ -355,6 +393,7 @@ function buildSimpleTeam({
       },
     },
   ]
+  const rootEvents = Array.isArray(rootEventsOverride) ? [...rootEventsOverride] : defaultRootEvents
   const creationHeader = {}
   if (typeof cwd === 'string' && cwd.length > 0) creationHeader.cwd = cwd
   if (createdAt !== undefined) creationHeader.createdAt = createdAt
@@ -381,7 +420,10 @@ function buildSimpleTeam({
     services.sessions = {
       get(id) {
         if (id === teamId) return makeSession(teamId, rootEvents, { config: DEFAULT_CONFIG }, header)
-        if (memberIds.has(id)) return makeSession(id, [], { config: DEFAULT_CONFIG }, header)
+        if (memberIds.has(id)) {
+          const events = memberEvents !== null && Array.isArray(memberEvents?.[id]) ? memberEvents[id] : []
+          return makeSession(id, events, { config: DEFAULT_CONFIG }, header)
+        }
         return undefined
       },
     }
@@ -463,7 +505,7 @@ function assertLossless(value) {
 
 test('module exports inject=[webServer] and pure helpers', () => {
   assert.deepEqual(inject, ['webServer'])
-  assert.equal(VERSION, 3)
+  assert.equal(VERSION, 4)
   assert.equal(typeof apply, 'function')
   assert.equal(typeof collectTeams, 'function')
   assert.equal(typeof createSnapshot, 'function')
@@ -487,7 +529,7 @@ const EMPTY_TOTALS = { teams: 0, activeTeams: 0, members: 0, running: 0, tasks: 
 
 test('unsupported: no services yields ok:true + unsupported string + empty teams/projects', () => {
   const snapshot = createSnapshot(createFakeContext())
-  assert.equal(snapshot.version, 3)
+  assert.equal(snapshot.version, 4)
   assert.equal(snapshot.ok, true)
   assert.equal(typeof snapshot.unsupported, 'string')
   assert.ok(snapshot.unsupported.length > 0)
@@ -536,7 +578,7 @@ test('one team: members, project fallback, enrichment, counts, tasks, and activi
   const { services } = buildTeamServices()
   const snapshot = createSnapshot(createFakeContext(services))
 
-  assert.equal(snapshot.version, 3)
+  assert.equal(snapshot.version, 4)
   assert.equal(snapshot.ok, true)
   assert.equal(snapshot.unsupported, null)
   assert.equal(snapshot.teams.length, 1)
@@ -552,6 +594,9 @@ test('one team: members, project fallback, enrichment, counts, tasks, and activi
   // v3 stats: no sessionProjections service mounted and no creation-header createdAt
   assert.deepEqual(team.stats, NULL_TEAM_STATS)
   for (const member of team.members) assert.deepEqual(member.stats, NULL_MEMBER_STATS)
+
+  // v4 edges: one structural lead edge; the fixture log has no mailbox events
+  assert.deepEqual(team.edges, [{ from: ROOT_ID, to: TEAMMATE_ID, kind: 'lead', weight: 1, lastAt: null }])
 
   // counts: 2 members (running), 4 tasks (1 in_progress, 1 blocked pending, 1 completed, 1 ready pending)
   assert.deepEqual(team.counts, {
@@ -686,6 +731,7 @@ test('missing sessions service degrades enrichment/activity and leaves project n
   assert.equal(team.project, null)
   assert.deepEqual(snapshot.projects, [])
   assert.deepEqual(team.activity, [])
+  assert.deepEqual(team.edges, [{ from: ROOT_ID, to: TEAMMATE_ID, kind: 'lead', weight: 1, lastAt: null }])
   for (const member of team.members) {
     assert.equal(member.lastActivityAt, null)
     assert.equal(member.lastEventType, null)
@@ -1417,6 +1463,335 @@ test('stats: workingRatio clamps/rounds and is null without a positive denominat
 })
 
 // ---------------------------------------------------------------------------
+// v4 team edges (structural lead edges + mailbox message aggregation)
+// ---------------------------------------------------------------------------
+
+test('edges: structural lead edges follow member order; single-member team has none', () => {
+  const members = [teammateView('session-a'), teammateView('session-b', 'inactive'), teammateView('session-c', 'provisioning')]
+  const fixture = buildSimpleTeam({ teamId: 'session-hub', members })
+  const snapshot = createSnapshot(createFakeContext(fixture.services))
+  const team = snapshot.teams[0]
+
+  assert.deepEqual(team.edges, [
+    { from: 'session-hub', to: 'session-a', kind: 'lead', weight: 1, lastAt: null },
+    { from: 'session-hub', to: 'session-b', kind: 'lead', weight: 1, lastAt: null },
+    { from: 'session-hub', to: 'session-c', kind: 'lead', weight: 1, lastAt: null },
+  ])
+  const memberIds = new Set(team.members.map((member) => member.id))
+  for (const edge of team.edges) {
+    assert.ok(memberIds.has(edge.from))
+    assert.ok(memberIds.has(edge.to))
+    assert.equal(Number.isInteger(edge.weight), true)
+    assert.ok(edge.weight >= 1)
+    assert.equal(edge.lastAt, null)
+    assert.equal(edge.kind, 'lead')
+  }
+  // v3 fields still exist next to the v4 edges.
+  assert.equal(team.counts.members, 4)
+  assert.equal(team.active, true)
+  assert.deepEqual(team.stats, NULL_TEAM_STATS)
+  assertLossless(snapshot)
+
+  // A single-member team is listed only through its task board, and has no edges.
+  const rootAgent = { id: ROOT_ID, status: 'running' }
+  const singleMemberServices = {
+    agents: { list: () => [rootAgent] },
+    agentTeams: {
+      tryMembership: () => ({ root: rootAgent, id: ROOT_ID, role: 'lead', name: 'lead' }),
+      listMembers: () => [{ id: ROOT_ID, name: 'lead', role: 'lead', status: 'running', diagnostics: [] }],
+      listTasks: () => [taskView({ id: 'task-1', status: 'in_progress' })],
+    },
+  }
+  const singleSnapshot = createSnapshot(createFakeContext(singleMemberServices))
+  assert.equal(singleSnapshot.teams.length, 1)
+  assert.deepEqual(singleSnapshot.teams[0].edges, [])
+  assertLossless(singleSnapshot)
+})
+
+test('edges: message weights, lastAt, bidirectional pairs and ordering', () => {
+  const teamId = 'session-graph'
+  const members = ['session-a', 'session-b', 'session-c', 'session-d'].map((id) => teammateView(id))
+  const rootEvents = [
+    messageEvent(1, 1000, { teamId, senderId: 'session-a', senderName: 'a', targetId: 'session-b' }),
+    messageEvent(2, 2000, { teamId, senderId: 'session-b', senderName: 'b', targetId: 'session-a' }),
+    messageEvent(3, 3000, { teamId, senderId: 'session-a', senderName: 'a', targetId: 'session-b' }),
+    messageEvent(4, 4000, { teamId, senderId: 'session-a', senderName: 'a', targetId: 'session-c' }),
+    messageEvent(5, 4000, { teamId, senderId: 'session-a', senderName: 'a', targetId: 'session-d' }),
+    messageEvent(6, 5000, { teamId, senderId: 'session-b', senderName: 'b', targetId: 'session-a' }),
+  ]
+  const fixture = buildSimpleTeam({ teamId, members, rootEvents })
+  const snapshot = createSnapshot(createFakeContext(fixture.services))
+  const team = snapshot.teams[0]
+
+  assert.deepEqual(team.edges, [
+    { from: teamId, to: 'session-a', kind: 'lead', weight: 1, lastAt: null },
+    { from: teamId, to: 'session-b', kind: 'lead', weight: 1, lastAt: null },
+    { from: teamId, to: 'session-c', kind: 'lead', weight: 1, lastAt: null },
+    { from: teamId, to: 'session-d', kind: 'lead', weight: 1, lastAt: null },
+    { from: 'session-b', to: 'session-a', kind: 'message', weight: 2, lastAt: 5000 },
+    { from: 'session-a', to: 'session-b', kind: 'message', weight: 2, lastAt: 3000 },
+    { from: 'session-a', to: 'session-c', kind: 'message', weight: 1, lastAt: 4000 },
+    { from: 'session-a', to: 'session-d', kind: 'message', weight: 1, lastAt: 4000 },
+  ])
+  assertLossless(snapshot)
+})
+
+test('edges: message weight caps at 99 and lastAt keeps the newest event time', () => {
+  const teamId = 'session-cap'
+  const members = [teammateView('session-a')]
+  const rootEvents = []
+  for (let index = 0; index < 120; index += 1) {
+    rootEvents.push(messageEvent(index + 1, 1000 + index, { teamId, senderId: 'session-a', senderName: 'a', targetId: teamId }))
+  }
+  const fixture = buildSimpleTeam({ teamId, members, rootEvents })
+  const snapshot = createSnapshot(createFakeContext(fixture.services))
+  const messageEdges = snapshot.teams[0].edges.filter((edge) => edge.kind === 'message')
+  assert.deepEqual(messageEdges, [{ from: 'session-a', to: teamId, kind: 'message', weight: 99, lastAt: 1119 }])
+  assert.equal(snapshot.teams[0].edges.length, 2)
+  assertLossless(snapshot)
+})
+
+test('edges: self-edges, unknown members, foreign team ids and malformed payloads are dropped', () => {
+  const teamId = 'session-mail'
+  const members = [teammateView('session-a'), teammateView('session-b')]
+  const rootEvents = [
+    messageEvent(1, 1000, { teamId, senderId: 'session-a', senderName: 'a', targetId: 'session-a' }), // self-edge
+    messageEvent(2, 1100, { teamId, senderId: 'session-ghost', senderName: 'g', targetId: 'session-a' }), // unknown sender
+    messageEvent(3, 1200, { teamId, senderId: 'session-a', senderName: 'a', targetId: 'session-ghost' }), // unknown target
+    messageEvent(4, 1300, { teamId: 'session-other', senderId: 'session-a', senderName: 'a', targetId: 'session-b' }), // foreign team
+    { type: 'team/message/queued', seq: 5, time: 1400, data: { teamId } }, // no message payload
+    { type: 'team/message/queued', seq: 6, time: 1500, data: { teamId, message: null } },
+    { type: 'team/message/queued', seq: 7, time: 1600, data: { teamId, message: { senderId: 42, targetId: 'session-b' } } },
+    { type: 'team/message/queued', seq: 8, time: 1700, data: { teamId, message: { senderId: 'session-a', targetId: null } } },
+    { type: 'team/message/queued', seq: 9, time: 1800, data: 'garbage' },
+    { type: 'team/task', seq: 10, time: 1900, data: { teamId, task: { id: 'task-x' } } }, // unrelated type
+    messageEvent(11, 2000, { teamId, senderId: 'session-b', senderName: 'b', targetId: 'session-a' }), // only valid pair
+  ]
+  const fixture = buildSimpleTeam({ teamId, members, rootEvents })
+  const snapshot = createSnapshot(createFakeContext(fixture.services))
+  assert.deepEqual(snapshot.teams[0].edges, [
+    { from: teamId, to: 'session-a', kind: 'lead', weight: 1, lastAt: null },
+    { from: teamId, to: 'session-b', kind: 'lead', weight: 1, lastAt: null },
+    { from: 'session-b', to: 'session-a', kind: 'message', weight: 1, lastAt: 2000 },
+  ])
+  assertLossless(snapshot)
+})
+
+test('edges: the message scan is bounded to the newest 2000 events', () => {
+  const teamId = 'session-bound'
+  const members = [teammateView('session-a')]
+  const rootEvents = [messageEvent(0, 100, { teamId, senderId: 'session-a', senderName: 'a', targetId: teamId })] // too old
+  for (let seq = 1; seq < 2000; seq += 1) rootEvents.push({ type: 'tool/result', seq, time: 500, data: {} })
+  rootEvents.push(messageEvent(2000, 9999, { teamId, senderId: 'session-a', senderName: 'a', targetId: teamId }))
+  const fixture = buildSimpleTeam({ teamId, members, rootEvents })
+  const snapshot = createSnapshot(createFakeContext(fixture.services))
+  const team = snapshot.teams[0]
+  // session.seq is 2001, so the window starts at seq 1: the seq-0 message is outside it.
+  assert.equal(team.edges.length, 2)
+  assert.deepEqual(
+    team.edges.filter((edge) => edge.kind === 'message'),
+    [{ from: 'session-a', to: teamId, kind: 'message', weight: 1, lastAt: 9999 }],
+  )
+  assertLossless(snapshot)
+})
+
+test('edges: missing or throwing Lead session degrades to structural edges only', () => {
+  const noSessions = buildTeamServices({ withSessions: false })
+  const noSessionsSnapshot = createSnapshot(createFakeContext(noSessions.services))
+  assert.deepEqual(noSessionsSnapshot.teams[0].edges, [{ from: ROOT_ID, to: TEAMMATE_ID, kind: 'lead', weight: 1, lastAt: null }])
+
+  const throwingGet = buildTeamServices()
+  throwingGet.services.sessions = {
+    get() {
+      throw new Error('sessions broke')
+    },
+  }
+  let throwingGetSnapshot
+  assert.doesNotThrow(() => {
+    throwingGetSnapshot = createSnapshot(createFakeContext(throwingGet.services))
+  })
+  assert.deepEqual(throwingGetSnapshot.teams[0].edges, [{ from: ROOT_ID, to: TEAMMATE_ID, kind: 'lead', weight: 1, lastAt: null }])
+
+  const throwingLog = buildTeamServices()
+  const baseSessions = throwingLog.services.sessions
+  throwingLog.services.sessions = {
+    get(id) {
+      if (id !== ROOT_ID) return baseSessions.get(id)
+      return {
+        id: ROOT_ID,
+        seq: 10,
+        snapshotEvents() {
+          throw new Error('log broke')
+        },
+      }
+    },
+  }
+  const logSnapshot = createSnapshot(createFakeContext(throwingLog.services))
+  assert.deepEqual(logSnapshot.teams[0].edges, [{ from: ROOT_ID, to: TEAMMATE_ID, kind: 'lead', weight: 1, lastAt: null }])
+  assertLossless(noSessionsSnapshot)
+  assertLossless(throwingGetSnapshot)
+  assertLossless(logSnapshot)
+})
+
+// ---------------------------------------------------------------------------
+// v4.1 live agent-message edges (source A in the target member's session log)
+// ---------------------------------------------------------------------------
+
+test('edges: live agent-message traffic covers lead->member, member->lead and member<->member', () => {
+  const teamId = 'session-team'
+  const members = [teammateView('session-a'), teammateView('session-b')]
+  // member->lead lands in the Lead log; lead->member and member<->member land
+  // in the target member's log.
+  const rootEvents = [agentMessageEvent(1, 2000, { senderSessionId: 'session-a' })]
+  const memberEvents = {
+    'session-a': [
+      agentMessageEvent(1, 1000, { senderSessionId: teamId }),
+      agentMessageEvent(2, 4000, { senderSessionId: 'session-b' }),
+    ],
+    'session-b': [agentMessageEvent(1, 3000, { senderSessionId: 'session-a' })],
+  }
+  const fixture = buildSimpleTeam({ teamId, members, rootEvents, memberEvents })
+  const snapshot = createSnapshot(createFakeContext(fixture.services))
+  const team = snapshot.teams[0]
+
+  assert.deepEqual(team.edges, [
+    { from: teamId, to: 'session-a', kind: 'lead', weight: 1, lastAt: null },
+    { from: teamId, to: 'session-b', kind: 'lead', weight: 1, lastAt: null },
+    { from: 'session-b', to: 'session-a', kind: 'message', weight: 1, lastAt: 4000 },
+    { from: 'session-a', to: 'session-b', kind: 'message', weight: 1, lastAt: 3000 },
+    { from: 'session-a', to: teamId, kind: 'message', weight: 1, lastAt: 2000 },
+    { from: teamId, to: 'session-a', kind: 'message', weight: 1, lastAt: 1000 },
+  ])
+  // v3/v2 data is untouched by the new live source.
+  assert.equal(team.counts.members, 3)
+  assert.equal(team.active, true)
+  assert.deepEqual(team.stats, NULL_TEAM_STATS)
+  assertLossless(snapshot)
+})
+
+test('edges: live agent-message weights aggregate and combine with legacy queued traffic', () => {
+  const teamId = 'session-combined'
+  const members = [teammateView('session-a')]
+  const rootEvents = [
+    agentMessageEvent(1, 1000, { senderSessionId: 'session-a' }), // live a->lead
+    agentMessageEvent(2, 2500, { senderSessionId: 'session-a' }), // live a->lead
+    messageEvent(3, 1500, { teamId, senderId: 'session-a', senderName: 'a', targetId: teamId }), // legacy a->lead
+  ]
+  const memberEvents = {
+    'session-a': [agentMessageEvent(1, 3000, { senderSessionId: teamId })], // live lead->a
+  }
+  const fixture = buildSimpleTeam({ teamId, members, rootEvents, memberEvents })
+  const snapshot = createSnapshot(createFakeContext(fixture.services))
+  assert.deepEqual(snapshot.teams[0].edges, [
+    { from: teamId, to: 'session-a', kind: 'lead', weight: 1, lastAt: null },
+    { from: 'session-a', to: teamId, kind: 'message', weight: 3, lastAt: 2500 },
+    { from: teamId, to: 'session-a', kind: 'message', weight: 1, lastAt: 3000 },
+  ])
+  assertLossless(snapshot)
+})
+
+test('edges: non-agent-message user messages, self/unknown senders and malformed sources are ignored', () => {
+  const teamId = 'session-filter'
+  const members = [teammateView('session-a')]
+  const memberEvents = {
+    'session-a': [
+      { type: 'user/message', seq: 1, time: 1000, data: { role: 'user', content: 'human input' } }, // no source
+      agentMessageEvent(2, 1100, { senderSessionId: teamId, kind: 'human' }), // not an agent message
+      { type: 'user/message', seq: 3, time: 1200, data: { role: 'user', source: { kind: 'agent-message', senderSessionId: 42 } } },
+      { type: 'user/message', seq: 4, time: 1300, data: { role: 'user', source: { kind: 'agent-message', form: 'relay' } } },
+      agentMessageEvent(5, 1400, { senderSessionId: 'session-a' }), // self-send
+      agentMessageEvent(6, 1500, { senderSessionId: 'session-ghost' }), // unknown sender
+      { type: 'user/message', seq: 7, time: 1600, data: 'garbage' },
+      { type: 'user/message', seq: 8, time: 1700, data: null },
+      agentMessageEvent(9, 1800, { senderSessionId: teamId }), // valid lead->a
+    ],
+  }
+  const rootEvents = [agentMessageEvent(1, 1900, { senderSessionId: 'session-a' })] // valid a->lead
+  const fixture = buildSimpleTeam({ teamId, members, rootEvents, memberEvents })
+  const snapshot = createSnapshot(createFakeContext(fixture.services))
+  assert.deepEqual(snapshot.teams[0].edges, [
+    { from: teamId, to: 'session-a', kind: 'lead', weight: 1, lastAt: null },
+    { from: 'session-a', to: teamId, kind: 'message', weight: 1, lastAt: 1900 },
+    { from: teamId, to: 'session-a', kind: 'message', weight: 1, lastAt: 1800 },
+  ])
+  assertLossless(snapshot)
+})
+
+test('edges: live agent-message scan is bounded to the newest 1000 member events', () => {
+  const teamId = 'session-live-bound'
+  const members = [teammateView('session-a')]
+  const memberEventsA = [agentMessageEvent(0, 100, { senderSessionId: teamId })] // outside the window
+  for (let seq = 1; seq < 1000; seq += 1) memberEventsA.push({ type: 'tool/result', seq, time: 500, data: {} })
+  memberEventsA.push(agentMessageEvent(1000, 9999, { senderSessionId: teamId }))
+  const fixture = buildSimpleTeam({ teamId, members, memberEvents: { 'session-a': memberEventsA } })
+  const snapshot = createSnapshot(createFakeContext(fixture.services))
+  const team = snapshot.teams[0]
+  // The member session seq is 1001, so the window starts at seq 1 and the seq-0
+  // delivery is excluded: weight stays 1 rather than 2.
+  assert.deepEqual(
+    team.edges.filter((edge) => edge.kind === 'message'),
+    [{ from: teamId, to: 'session-a', kind: 'message', weight: 1, lastAt: 9999 }],
+  )
+  assertLossless(snapshot)
+})
+
+test('edges: a throwing member session only drops that member live contribution', () => {
+  const teamId = 'session-degrade'
+  const members = [teammateView('session-a'), teammateView('session-b')]
+  const rootEvents = [
+    messageEvent(1, 2000, { teamId, senderId: 'session-b', senderName: 'b', targetId: 'session-a' }), // legacy source survives
+  ]
+  const fixture = buildSimpleTeam({
+    teamId,
+    members,
+    rootEvents,
+    memberEvents: {
+      'session-a': [
+        agentMessageEvent(1, 1000, { senderSessionId: teamId }),
+        agentMessageEvent(2, 3000, { senderSessionId: 'session-b' }),
+      ],
+      'session-b': [agentMessageEvent(1, 4000, { senderSessionId: teamId })], // must be lost with the log
+    },
+  })
+  const baseSessions = fixture.services.sessions
+  fixture.services.sessions = {
+    get(id) {
+      if (id === 'session-b') {
+        return {
+          id: 'session-b',
+          seq: 10,
+          snapshotEvents() {
+            throw new Error('member log broke')
+          },
+        }
+      }
+      return baseSessions.get(id)
+    },
+  }
+  let snapshot
+  assert.doesNotThrow(() => {
+    snapshot = createSnapshot(createFakeContext(fixture.services))
+  })
+  const team = snapshot.teams[0]
+  assert.deepEqual(
+    team.edges.filter((edge) => edge.kind === 'message'),
+    [
+      { from: 'session-b', to: 'session-a', kind: 'message', weight: 2, lastAt: 3000 },
+      { from: teamId, to: 'session-a', kind: 'message', weight: 1, lastAt: 1000 },
+    ],
+  )
+  assert.equal(
+    team.edges.some((edge) => edge.kind === 'message' && edge.to === 'session-b'),
+    false,
+  )
+  assert.deepEqual(team.edges.slice(0, 2), [
+    { from: teamId, to: 'session-a', kind: 'lead', weight: 1, lastAt: null },
+    { from: teamId, to: 'session-b', kind: 'lead', weight: 1, lastAt: null },
+  ])
+  assertLossless(snapshot)
+})
+
+// ---------------------------------------------------------------------------
 // defensive normalization
 // ---------------------------------------------------------------------------
 
@@ -1646,7 +2021,7 @@ test('snapshot stays lossless even when roster/task rows contain undefined and j
 // HTTP route
 // ---------------------------------------------------------------------------
 
-test('route: GET snapshot -> 200 JSON v3 with cache headers; other requests -> 404', async () => {
+test('route: GET snapshot -> 200 JSON v4 with cache headers; other requests -> 404', async () => {
   const { services } = buildTeamServices()
   const handler = createRouteHandler(createFakeContext(services))
 
@@ -1657,20 +2032,22 @@ test('route: GET snapshot -> 200 JSON v3 with cache headers; other requests -> 4
   assert.equal(okResponse.headers['cache-control'], 'no-store')
   const body = JSON.parse(okResponse.body)
   assert.equal(body.ok, true)
-  assert.equal(body.version, 3)
+  assert.equal(body.version, 4)
   assert.equal(body.teams.length, 1)
   assert.equal(body.projects.length, 1)
   assert.equal(body.totals.activeTeams, 1)
   // v3 stats are on the wire even when the projections are unavailable.
   assert.deepEqual(body.teams[0].stats, NULL_TEAM_STATS)
   assert.deepEqual(body.teams[0].members[0].stats, NULL_MEMBER_STATS)
+  // v4 edges are on the wire too (structural only for the default fixture).
+  assert.deepEqual(body.teams[0].edges, [{ from: ROOT_ID, to: TEAMMATE_ID, kind: 'lead', weight: 1, lastAt: null }])
   assertLossless(body)
 
   const notFoundResponse = createFakeResponse()
   await handler({ method: 'POST', url: '/api/team-console/snapshot' }, notFoundResponse)
   assert.equal(notFoundResponse.statusCode, 404)
   assert.equal(JSON.parse(notFoundResponse.body).ok, false)
-  assert.equal(JSON.parse(notFoundResponse.body).version, 3)
+  assert.equal(JSON.parse(notFoundResponse.body).version, 4)
 
   const wrongPathResponse = createFakeResponse()
   await handler({ method: 'GET', url: '/api/team-console/other' }, wrongPathResponse)
@@ -1696,7 +2073,7 @@ test('route: aggregation failure -> 500 valid JSON, handler never rejects', asyn
   await assert.doesNotReject(() => handler({ method: 'GET', url: '/api/team-console/snapshot' }, response))
   assert.equal(response.statusCode, 500)
   const body = JSON.parse(response.body)
-  assert.equal(body.version, 3)
+  assert.equal(body.version, 4)
   assert.equal(body.ok, false)
   assert.equal(body.error, 'boom')
   assert.deepEqual(body.teams, [])
@@ -1733,7 +2110,7 @@ test('route: DSH connection admission is enforced when the connection service is
   assert.equal(anonymousResponse.headers['content-type'], 'application/json; charset=utf-8')
   assert.equal(anonymousResponse.headers['cache-control'], 'no-store')
   const anonymousBody = JSON.parse(anonymousResponse.body)
-  assert.equal(anonymousBody.version, 3)
+  assert.equal(anonymousBody.version, 4)
   assert.equal(anonymousBody.ok, false)
   assert.equal(anonymousBody.error, 'unauthorized')
   assert.deepEqual(anonymousBody.teams, [])

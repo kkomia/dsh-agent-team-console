@@ -12,7 +12,8 @@ request flow.
 In scope:
 
 - More accurate or more resilient snapshot aggregation in the host half.
-- Clearer presentation of the workspace-first stage, member statistics, and task summary in the panel.
+- Clearer presentation of the workspace-first interaction graph, pixel-art agents, member statistics,
+  and task summary in the panel.
 - Accessibility, keyboard, theme, and reduced-motion improvements.
 - Bilingual copy fixes (Chinese and English dictionaries must stay in sync).
 - Tests for defensive parsing and the HTTP contract.
@@ -78,7 +79,7 @@ are prefixed `[agent-team-console]`. To probe the snapshot route of a running se
 TEAM_CONSOLE_URL=http://127.0.0.1:10100 node scripts/verify-live.mjs
 ```
 
-It exits `0` when the v3 contract matches, `1` on an unreachable route or contract violation, and `2`
+It exits `0` when the v4 contract matches, `1` on an unreachable route or contract violation, and `2`
 when admission rejects the request as unauthenticated. A `2` is expected against a running DSH
 desktop app: the route enforces DSH connection admission, so an anonymous command-line probe is
 answered with a JSON 401 before any snapshot logic; it is not a plugin failure.
@@ -131,11 +132,17 @@ Match the existing style; there is no formatter configuration to run and no lint
   'sessionStats')` and `stateOf(session, 'tokenUsage')`): two bounded projection reads per member, no
   session-log scans for stats, and all-null degradation when the service or a unit is unavailable.
   Team stats are null-safe aggregates of the member rows.
+- Interaction edges (`team.edges`) are structural `lead` edges plus aggregated `message` edges from
+  two bounded sources: live `agent-message` deliveries in each member session log (newest 1000 events
+  per listed member, Lead included) and legacy `team/message/queued` records in the newest 2000
+  Lead-session events. Weights add across both sources; drop self-edges and unknown endpoints, cap
+  message weight at 99, and order lead edges first. Never enable a full-log scan or add a new required
+  service for the graph.
 - Keep the host stateless: no mutable module state, no timers, no filesystem access, no mutation of
   service objects. The whole aggregation stays synchronous; do not call async registry APIs.
 - Every response must be JSON-safe. Convert branded ids with `String(...)`, replace `undefined`
   with `null`, cap long strings, and catch unexpected aggregation errors into a valid JSON 500.
-- Keep the snapshot contract versioned (`VERSION`, currently `3`). Additive fields are fine;
+- Keep the snapshot contract versioned (`VERSION`, currently `4`). Additive fields are fine;
   removing or renaming a field requires a contract version bump and matching client support.
 
 ### Client half (`client.js`) rules
@@ -156,14 +163,14 @@ Match the existing style; there is no formatter configuration to run and no lint
   (`ready === true`) or a blocked marker (`ready === false`). In-progress and completed tasks must not
   render a blocked warning even though the runtime reports `ready: false` for them, and a retained
   `blockedBy` list alone must not be treated as blocked.
-- The visual-first rules: the workspace/project name leads each team header; the agent stage is SVG
-  with one node per member; node size/ring/status motion comes from the contract stats; the activity
-  list must not be rendered (it stays in the wire contract only).
-- The stage and the working-vs-idle donut use only `--dsw-*` tokens for SVG fill/stroke, and every
-  animation (pulse, orbit, dashed spin, donut transition) must be disabled under
-  `prefers-reduced-motion`.
-- Keep stage nodes and team headers keyboard accessible (focusable nodes with descriptive labels and
-  focus-visible outlines; `aria-expanded` on team and task-summary toggles).
+- The graph-first rules: the workspace/project name leads each team header; the body is an SVG
+  interaction graph (Lead hub, member ring, lead/message edges) whose members are deterministic
+  pixel-art characters; the activity list must not be rendered (it stays in the wire contract only).
+- Draw the graph and characters with `--dsw-*` tokens only for SVG fill/stroke; never fetch external
+  sprites or images. Every animation (pulse, character bob/spark, dashed spin, edge flow, donut
+  transition) must be disabled under `prefers-reduced-motion`.
+- Keep graph nodes and team headers keyboard accessible (focusable nodes with descriptive labels
+  including message counts, edges decorative, `aria-expanded` on team and task-summary toggles).
 - The project filter is local UI state only: never persist it or require host configuration for it.
 
 ### Tests
@@ -173,9 +180,11 @@ Match the existing style; there is no formatter configuration to run and no lint
 - Cover defensive behavior: project resolution (workspace matches, cwd fallback, missing/throwing
   registry), active-first ordering, the `idle`/`ready` counts and `active` flags, session stats
   (projection mapping, token sums, work/idle/ratio math and clamping, the `live` flag, and
-  missing/throwing projections), unknown event shapes, missing services, throwing services, connection
-  admission (401, 403, and fail-closed on a throwing check), JSON safety, and the 200/404/500 route
-  shapes.
+  missing/throwing projections), interaction edges (structural lead edges, live `agent-message`
+  aggregation, legacy queued aggregation, combined weights, the weight cap, unknown/self endpoint
+  drops, dedupe/order, both scan bounds, and structural-only degradation), unknown event shapes,
+  missing services, throwing services, connection admission (401, 403, and fail-closed on a throwing
+  check), JSON safety, and the 200/404/500 route shapes.
 - A new snapshot field or behavior change should come with a test that would fail without the change.
 
 ### Manifest and DSH plugin rules

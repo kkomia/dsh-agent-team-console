@@ -7,6 +7,49 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-10-17
+
+Graph-first UI with pixel-art agents and snapshot contract version 4.
+
+### Added
+
+- Snapshot contract v4: every listed team carries `edges[]` — structural `lead` edges (Lead to each
+  teammate, weight 1, no timestamp) plus aggregated `message` edges from two bounded sources: live
+  `agent-message` deliveries observed in each member's session log (newest 1000 events per listed
+  member, Lead included) and legacy `team/message/queued` records in the newest 2000 Lead-session
+  events. Weights add across both sources, message counts cap at 99, `lastAt` keeps the newest observed
+  time, self-edges and unknown/malformed endpoints are dropped, and edges are deduped and ordered
+  lead-first, then weight/lastAt.
+- Animated SVG interaction graph: Lead at the center hub, teammates on an evenly spaced ring (up to 8
+  plus a "+N" node), faint quadratic lead spokes, curved message chords whose thickness scales with
+  weight and opacity with recency, an animated direction flow on recent edges, and a structural star
+  fallback when a payload has no edge data.
+- Deterministic pixel-art characters: every member is drawn from an SVG rectangle template with a
+  theme-token palette (brand outfit and marker for the Lead); running bobs with a work spark,
+  provisioning spins and blinks, idle is muted, and failed keeps a static error ring.
+- Graph legend and an edge recap in the hover/focus detail card (messages received/sent per member).
+- Host tests for the v4 edges: structural edges, live `agent-message` aggregation (lead-to-member,
+  member-to-lead, member-to-member), legacy queued aggregation, weights combining across both sources,
+  the weight cap, endpoint validation, dedupe/order, the per-member 1000-event and Lead 2000-event
+  bounds, and structural-only degradation (50 tests total).
+
+### Changed
+
+- Replaced the linear agent stage with the interaction graph.
+- Replaced letter avatars with deterministic pixel-art characters.
+- Package version bumped to 1.3.0, and `verify-live` now validates the v4 contract.
+- Updated the READMEs and design notes for the graph-first UI and contract version 4.
+
+### Notes
+
+- The snapshot contract is now version 4. It adds fields only; the endpoint stays read-only,
+  same-origin, admission-checked, and mutation-free.
+- Message edges come from two bounded session-log sources (the newest 1000 events per listed member
+  plus the newest 2000 Lead-session events for legacy records): no full-log scan, no new required
+  service, and no mailbox rendering.
+- The activity list remains wire-only: the contract still carries it for API consumers, but the panel
+  does not render it.
+
 ## [1.2.0] - 2026-10-17
 
 Visual-first agent stage with snapshot contract version 3.

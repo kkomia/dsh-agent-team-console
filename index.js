@@ -5,12 +5,25 @@
  *
  *   GET /api/team-console/snapshot
  *
- * and answers with a self-contained JSON snapshot (contract version 3) of every
+ * and answers with a self-contained JSON snapshot (contract version 4) of every
  * live Agent Team that the Host services `agentTeams` / `agents` / `sessions`
  * and the optional `workspaceRegistry` / `sessionProjections` can see. The
  * Client half (`client.js`) polls this endpoint; this file never touches the
  * disk, never starts timers, and keeps no mutable module state — every request
  * rebuilds the snapshot from the live services.
+ *
+ * Contract version 4 additions (see docs/design.md):
+ *  - Every listed team carries `edges`: the interaction graph of its members.
+ *    `lead` edges are structural (Lead member id -> every other listed member,
+ *    weight 1, no timestamp). `message` edges aggregate two bounded sources:
+ *    (A) live `agent-message` user messages in each member session log — the
+ *    target member's newest 1000 events carry `user/message` events whose
+ *    `data.source` is `{ kind: 'agent-message', form: 'relay', senderSessionId }`;
+ *    (B) legacy `team/message/queued` mailbox events in the Lead session log —
+ *    the newest 2000 events. Both sources aggregate per ordered sender -> target
+ *    (weight = count capped at 99, lastAt = newest event time); self-edges,
+ *    unknown member ids and malformed payloads are dropped, so every endpoint
+ *    names a listed member.
  *
  * Contract version 3 additions (see docs/design.md):
  *  - Every listed member carries `stats` and every listed team carries an
@@ -52,7 +65,10 @@
  *    `unsupported` instead of throwing; a missing workspace registry degrades to
  *    the cwd fallback; missing projections degrade the stats to nulls. The
  *    whole aggregation stays synchronous: no async request work, timers, disk
- *    access or mutations.
+ *    access or mutations. The v4 message-edge scans are bounded: one
+ *    `snapshotEvents` read of the newest 2000 Lead-session events (legacy
+ *    mailbox source) plus one read of the newest 1000 events per listed member
+ *    session (live agent-message source) per request.
  *  - When the DSH `connection` service is mounted, every request passes its
  *    Host/Origin fence and browser-session admission before the route answers,
  *    so an anonymous HTTP client is rejected the same way as the Web UI itself.
@@ -67,7 +83,7 @@
 export const inject = ['webServer']
 
 /** Snapshot contract version. */
-export const VERSION = 3
+export const VERSION = 4
 
 /** Valid JSON body used only when a response body cannot be encoded at all. */
 const ENCODING_FALLBACK = `{"version":${VERSION},"ok":false,"error":"snapshot could not be encoded","teams":[]}`
@@ -82,11 +98,23 @@ const ACTIVITY_INITIAL_WINDOW = 400
 const ACTIVITY_MAX_WINDOW = 20000
 const ACTIVITY_TARGET_ENTRIES = 12
 const MEMBER_SCAN_EVENTS = 60
+/** Fixed newest-event window scanned for v4 team/message/queued mailbox edges (never more). */
+const MESSAGE_SCAN_EVENTS = 2000
+/** Fixed newest-event window scanned per member session for live agent-message edges (never more). */
+const MEMBER_MESSAGE_SCAN_EVENTS = 1000
+/** Hard cap on one aggregated v4 message edge's weight. */
+const MESSAGE_WEIGHT_CAP = 99
 const ACTIVITY_TEXT_MAX = 200
 const DESCRIPTION_MAX = 2000
 
 /** Session event types owned by the Agent Teams projection (Lead session log only). */
 const TEAM_EVENT_TYPES = new Set(['team/member', 'team/task'])
+/** Legacy durable mailbox delivery event type aggregated into v4 message edges (source B). */
+const TEAM_MESSAGE_EVENT_TYPE = 'team/message/queued'
+/** Live agent-message delivery: a `user/message` event in the TARGET member's session log (source A). */
+const USER_MESSAGE_EVENT_TYPE = 'user/message'
+/** `data.source.kind` marking a user message as peer agent traffic rather than human input. */
+const AGENT_MESSAGE_SOURCE_KIND = 'agent-message'
 
 // ---------------------------------------------------------------------------
 // Small value helpers
@@ -1100,6 +1128,172 @@ function listWorkspaces(workspaceRegistry) {
 }
 
 // ---------------------------------------------------------------------------
+// Team interaction edges (v4)
+// ---------------------------------------------------------------------------
+//
+// The v4 `edges` array is the member interaction graph: structural `lead`
+// edges (the Lead owns each teammate) plus `message` edges aggregated from two
+// bounded session-log sources:
+//   A. Live traffic (current runtime): every listed member session (Lead
+//      included) is read once for its newest MEMBER_MESSAGE_SCAN_EVENTS (1000)
+//      events; a `user/message` event whose `data.source.kind` is
+//      'agent-message' is a peer delivery into the TARGET member's log, so
+//      `data.source.senderSessionId` -> member id is the observed edge.
+//   B. Legacy traffic: the Lead session's newest MESSAGE_SCAN_EVENTS (2000)
+//      events are scanned for `team/message/queued` mailbox deliveries.
+// Both sources aggregate into one pair set (weights add), with no extra
+// services, no timers and no full-log scan. Endpoints are always current listed
+// member ids, so the Client can draw the graph without dangling nodes.
+
+/** Sort one nullable timestamp descending, nulls last (used by message edges). */
+function compareEdgeLastAt(left, right) {
+  if (left === right) return 0
+  if (left === null) return 1
+  if (right === null) return -1
+  return right - left
+}
+
+/** Deterministic string comparison for the final edge tie-breakers. */
+function compareEdgeText(left, right) {
+  return left < right ? -1 : left > right ? 1 : 0
+}
+
+/** Record one observed message into the per-pair aggregate (weight capped, lastAt max). */
+function addMessageEdge(aggregated, senderId, targetId, time) {
+  const key = `${senderId}\u0000${targetId}`
+  let aggregate = aggregated.get(key)
+  if (aggregate === undefined) {
+    aggregate = { from: senderId, to: targetId, weight: 0, lastAt: null }
+    aggregated.set(key, aggregate)
+  }
+  if (aggregate.weight < MESSAGE_WEIGHT_CAP) aggregate.weight += 1
+  if (time !== null && (aggregate.lastAt === null || time > aggregate.lastAt)) aggregate.lastAt = time
+}
+
+/**
+ * Source A: live peer traffic delivered into each target member's session log.
+ * One bounded read per listed member; a `user/message` counts only when
+ * `data.source.kind === 'agent-message'` and `data.source.senderSessionId` is a
+ * non-empty current member id different from the target. Missing/throwing
+ * sessions contribute nothing for that member only (structural edges survive).
+ * @param aggregated - mutable pair map filled by this call.
+ * @param memberIds - Set of the team's current member ids.
+ * @param memberSessions - `{ id, session }` for every listed member (Lead included).
+ */
+function collectLiveMessageEdges(aggregated, memberIds, memberSessions) {
+  for (const entry of Array.isArray(memberSessions) ? memberSessions : []) {
+    if (!isRecord(entry) || typeof entry.id !== 'string') continue
+    const targetId = entry.id
+    if (targetId === '' || !memberIds.has(targetId)) continue
+    for (const event of readSessionEvents(entry.session, MEMBER_MESSAGE_SCAN_EVENTS)) {
+      if (!isRecord(event)) continue
+      if (firstText(event.type) !== USER_MESSAGE_EVENT_TYPE) continue
+      const data = isRecord(event.data) ? event.data : null
+      if (data === null) continue
+      const source = isRecord(data.source) ? data.source : null
+      if (source === null || source.kind !== AGENT_MESSAGE_SOURCE_KIND) continue
+      const senderId = typeof source.senderSessionId === 'string' ? source.senderSessionId : null
+      if (senderId === null || senderId === '') continue
+      if (senderId === targetId || !memberIds.has(senderId)) continue
+      addMessageEdge(aggregated, senderId, targetId, toFiniteNumber(event.time))
+    }
+  }
+}
+
+/**
+ * Source B: legacy `team/message/queued` mailbox deliveries in the Lead log.
+ * One bounded window; only events for this team whose string sender/target ids
+ * are current members contribute.
+ * @param aggregated - mutable pair map filled by this call.
+ * @param memberIds - Set of the team's current member ids.
+ * @param leadSession - live Lead Session (may be undefined / throwing).
+ * @param teamId - team id (equals the Lead session id).
+ */
+function collectLegacyMessageEdges(aggregated, memberIds, leadSession, teamId) {
+  for (const event of readSessionEvents(leadSession, MESSAGE_SCAN_EVENTS)) {
+    if (!isRecord(event)) continue
+    if (firstText(event.type) !== TEAM_MESSAGE_EVENT_TYPE) continue
+    const data = isRecord(event.data) ? event.data : null
+    if (data === null) continue
+    if (data.teamId !== teamId) continue
+    const message = isRecord(data.message) ? data.message : null
+    if (message === null) continue
+    const senderId = typeof message.senderId === 'string' ? message.senderId : null
+    const targetId = typeof message.targetId === 'string' ? message.targetId : null
+    if (senderId === null || targetId === null || senderId === '' || targetId === '') continue
+    if (senderId === targetId) continue
+    if (!memberIds.has(senderId) || !memberIds.has(targetId)) continue
+    addMessageEdge(aggregated, senderId, targetId, toFiniteNumber(event.time))
+  }
+}
+
+/**
+ * Aggregate, deduplicate and sort the v4 `message` edges of one team by
+ * combining the live member-log source (A) and the legacy Lead-log source (B).
+ * Pairs observed by both sources simply add their weights.
+ * @param memberIds - Set of the team's current member ids.
+ * @param leadSession - live Lead Session (may be undefined / throwing).
+ * @param teamId - team id (equals the Lead session id).
+ * @param memberSessions - `{ id, session }` for every listed member (Lead included).
+ * @returns unique, sorted message edges.
+ */
+function collectMessageEdges(memberIds, leadSession, teamId, memberSessions) {
+  const aggregated = new Map()
+  collectLiveMessageEdges(aggregated, memberIds, memberSessions)
+  collectLegacyMessageEdges(aggregated, memberIds, leadSession, teamId)
+  const messageEdges = [...aggregated.values()]
+  messageEdges.sort(
+    (left, right) =>
+      right.weight - left.weight ||
+      compareEdgeLastAt(left.lastAt, right.lastAt) ||
+      compareEdgeText(left.from, right.from) ||
+      compareEdgeText(left.to, right.to),
+  )
+  return messageEdges.map((edge) => ({
+    from: edge.from,
+    to: edge.to,
+    kind: 'message',
+    weight: edge.weight,
+    lastAt: edge.lastAt,
+  }))
+}
+
+/**
+ * Build the v4 `edges` array of one listed team: structural `lead` edges first
+ * (in the order the members appear after the Lead), then aggregated `message`
+ * edges from the two bounded session-log sources. Structural edges are dropped
+ * for teams with fewer than two members; a missing/throwing Lead or member
+ * session only degrades that source contribution (structural edges survive).
+ * @param members - normalized member rows of one listed team (Lead first).
+ * @param leadSession - live Lead Session (may be undefined).
+ * @param teamId - team id.
+ * @param memberSessions - `{ id, session }` for every listed member (Lead included).
+ * @returns unique edges with JSON-safe values, every endpoint a listed member.
+ */
+function collectTeamEdges(members, leadSession, teamId, memberSessions) {
+  const edges = []
+  try {
+    const memberIds = new Set()
+    for (const member of members) if (member.id !== '') memberIds.add(member.id)
+    const leadMember = members.find((member) => member.role === 'lead')
+    const seen = new Set()
+    if (leadMember !== undefined && leadMember.id !== '' && members.length >= 2) {
+      for (const member of members) {
+        if (member === leadMember || member.id === '' || member.id === leadMember.id) continue
+        const key = `lead\u0000${leadMember.id}\u0000${member.id}`
+        if (seen.has(key)) continue
+        seen.add(key)
+        edges.push({ from: leadMember.id, to: member.id, kind: 'lead', weight: 1, lastAt: null })
+      }
+    }
+    edges.push(...collectMessageEdges(memberIds, leadSession, teamId, memberSessions))
+  } catch {
+    /* Structural edges collected so far survive; message edges are best effort. */
+  }
+  return edges
+}
+
+// ---------------------------------------------------------------------------
 // Team aggregation
 // ---------------------------------------------------------------------------
 
@@ -1121,7 +1315,8 @@ function unsupportedReason(agentTeams, agents) {
  * Build one team entry plus its sort keys (active flag and most recent observed
  * activity time). Roster/task read failures become `team.error` and degrade to
  * whatever was readable; a team always lists its Lead row. Listed teams also
- * resolve `project` (v2) and member/team session `stats` (v3), both best effort.
+ * resolve `project` (v2), member/team session `stats` (v3) and the member
+ * interaction `edges` (v4), all best effort.
  * @param membership - Agent Team membership row from `agentTeams.tryMembership`.
  * @param agentTeams - Agent Teams service.
  * @param context - per-snapshot optional services and clock:
@@ -1179,11 +1374,13 @@ function buildTeam(membership, agentTeams, context) {
   let activity = []
   let leadSession
   let teamStats = emptyTeamStats()
+  const memberSessions = []
   if (listable) {
     const memberNames = new Map()
     for (const member of members) memberNames.set(member.id, member.name)
     for (const member of members) {
       const memberSession = getSessionSafe(sessions, member.id)
+      memberSessions.push({ id: member.id, session: memberSession })
       enrichMemberFromSession(member, memberSession)
       // v3 stats: two bounded projection reads + the creation-header cwd/createdAt.
       member.stats = buildMemberStats(member, memberSession, sessionProjections, now)
@@ -1193,8 +1390,11 @@ function buildTeam(membership, agentTeams, context) {
     teamStats = computeTeamStats(members)
   }
   // Non-listable teams never reach the snapshot, so project resolution and the
-  // stats reads above are only paid for the teams the Client can see.
+  // stats/edge reads above are only paid for the teams the Client can see.
   const project = listable ? resolveTeamProject(teamId, leadSession, workspaces) : null
+  // v4 edges: structural Lead edges plus the two bounded message-edge sources
+  // (live agent-message member logs + legacy Lead-log mailbox events).
+  const edges = listable ? collectTeamEdges(members, leadSession, teamId, memberSessions) : []
 
   const team = {
     id: teamId,
@@ -1206,6 +1406,7 @@ function buildTeam(membership, agentTeams, context) {
     members,
     tasks,
     activity,
+    edges,
   }
 
   let activityAt = 0

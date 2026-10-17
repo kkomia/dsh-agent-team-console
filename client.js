@@ -1,5 +1,5 @@
 /**
- * dsh-agent-team-console — Client half (browser bundle), snapshot contract v3.
+ * dsh-agent-team-console — Client half (browser bundle), snapshot contract v4.
  * ============================================================================
  * Self-registering classic script loaded through window.__ModuleLoader__:
  *   - id MUST equal the package name.
@@ -7,16 +7,18 @@
  *   - Registers a sidebar.panellist entry (id 'team-console') and a keyed
  *     main panel (key 'team-console') that polls the Host half at
  *     GET /api/team-console/snapshot (same origin, read-only, 2s cadence).
- *   - Read-only, visual-first design (1.2.0 / contract v3):
+ *   - Read-only, graph-first design (1.3.0 / contract v4):
  *       header (project filter, live dot, refresh)
  *       -> compact status chip strip (in-progress / running / tokens / blocked / pending)
  *       -> per-team section (active expanded, idle collapsed) whose header starts
  *          with the workspace/project name and carries the working-vs-idle donut
- *          and stats, and whose body is an animated SVG "agent stage" (one node
- *          per member: tokens-scaled avatar, working-ratio ring, status motion)
- *          plus a collapsed task summary line with in-progress rows on demand.
+ *          and stats, and whose body is an SVG interaction graph: the Lead hub in
+ *          the center, members on a ring, curved lead/message edges, and one
+ *          deterministic pixel-art character per member with status motion; plus
+ *          a collapsed task summary line with in-progress rows on demand.
  *     The activity timeline is intentionally not rendered (contract keeps it for
- *     API consumers); stats come from the contract v3 `team.stats` / `member.stats`.
+ *     API consumers); stats come from contract v3 `team.stats` / `member.stats`,
+ *     edges from contract v4 `team.edges` (with a structural star fallback).
  *   - All copy is bilingual through the Client locale service under the
  *     namespace 'agent-team-console' (zh + en kept key-for-key in sync); the
  *     Chinese dictionary is primary and the English one mirrors it.
@@ -35,12 +37,14 @@ window.__ModuleLoader__.load({
     const API = '/api/team-console/snapshot'
     const POLL_MS = 2000
     const MEMBER_LIMIT = 8
-    const NODE_GAP = 96
-    const STAGE_MIN_WIDTH = 340
-    const STAGE_HEIGHT = 140
-    const STAGE_CENTER_Y = 60
-    const STAGE_NAME_Y = 106
-    const STAGE_STAT_Y = 120
+    const GRAPH_PAD_X = 120
+    const GRAPH_PAD_Y = 96
+    const GRAPH_MIN_RADIUS = 112
+    const GRAPH_SLOT = 18
+    const EDGE_RECENT_MS = 30000
+    const PIXEL_SIZE = 2
+    const PIXEL_GRID_WIDTH = 10
+    const PIXEL_GRID_HEIGHT = 12
     const RADIUS_MIN = 16
     const RADIUS_MAX = 26
     const LEAD_RADIUS_BONUS = 2
@@ -85,10 +89,13 @@ window.__ModuleLoader__.load({
       'team.collapse': '收起',
       'team.unnamed': '未命名团队',
       'team.error': '团队数据读取失败：{message}',
-      'team.stageLabel': '{n} 位成员的实时状态',
-      'team.nodeAria': '{name}，{status}，{turns}，{tokens}',
+      'team.graphLabel': '{n} 位成员的协作关系图',
+      'team.edgeLead': 'Lead 连结',
+      'team.edgeMessage': '消息连线',
+      'team.edgeSummary': '消息 {in} 收 / {out} 发',
+      'team.overflow': '另有 {n} 位成员',
+      'team.nodeAria': '{name}，{status}，{turns}，{tokens}；{edges}',
       'team.statLine': '{turns} · {tokens}',
-      'team.moreMembers': '另有 {n} 位成员',
       'member.role.lead': 'Lead',
       'member.role.teammate': 'Teammate',
       'member.status.running': '运行中',
@@ -159,10 +166,13 @@ window.__ModuleLoader__.load({
       'team.collapse': 'Collapse',
       'team.unnamed': 'Unnamed team',
       'team.error': 'Team data could not be read: {message}',
-      'team.stageLabel': 'Live status of {n} members',
-      'team.nodeAria': '{name}, {status}, {turns}, {tokens}',
+      'team.graphLabel': 'Interaction graph of {n} members',
+      'team.edgeLead': 'Lead link',
+      'team.edgeMessage': 'Message link',
+      'team.edgeSummary': 'Messages {in} in / {out} out',
+      'team.overflow': '{n} more members',
+      'team.nodeAria': '{name}, {status}, {turns}, {tokens}; {edges}',
       'team.statLine': '{turns} · {tokens}',
-      'team.moreMembers': '{n} more members',
       'member.role.lead': 'Lead',
       'member.role.teammate': 'Teammate',
       'member.status.running': 'Running',
@@ -562,7 +572,7 @@ window.__ModuleLoader__.load({
       })
     }
 
-    /** The Lead node comes first; the remaining teammates keep the served order. */
+    /** The Lead member comes first; the remaining teammates keep served order. */
     function stageMembers(members) {
       const list = asArray(members)
       const lead = list.find((member) => asString(member && member.role) === 'lead') || null
@@ -572,6 +582,86 @@ window.__ModuleLoader__.load({
         if (member !== lead) ordered.push(member)
       }
       return ordered
+    }
+
+    /**
+     * Resolve the interaction graph for one rendered team. Endpoints must be
+     * rendered member ids; duplicate (from,to,kind) pairs are dropped. When the
+     * payload has no usable lead edge (v3 or older payloads), a structural star
+     * from the center member is derived so the graph still renders as a star.
+     */
+    function teamGraphEdges(team, renderedMembers) {
+      const ids = new Set()
+      for (const member of renderedMembers) {
+        const id = asString(member && member.id)
+        if (id) ids.add(id)
+      }
+      const centerId = asString(renderedMembers[0] && renderedMembers[0].id)
+      const edges = []
+      const seen = new Set()
+      const addEdge = (from, to, kind, weight, lastAt) => {
+        if (!from || !to || from === to) return
+        if (!ids.has(from) || !ids.has(to)) return
+        const key = kind + '\u0000' + from + '\u0000' + to
+        if (seen.has(key)) return
+        seen.add(key)
+        const parsedWeight = asNumber(weight)
+        edges.push({
+          from,
+          to,
+          kind,
+          weight: parsedWeight === null ? 1 : Math.max(1, Math.round(parsedWeight)),
+          lastAt: asNumber(lastAt),
+        })
+      }
+      for (const edge of asArray(team && team.edges)) {
+        if (!edge || typeof edge !== 'object') continue
+        const kind = asString(edge.kind)
+        if (kind !== 'lead' && kind !== 'message') continue
+        addEdge(asString(edge.from), asString(edge.to), kind, edge.weight, edge.lastAt)
+      }
+      const hasLead = edges.some((edge) => edge.kind === 'lead')
+      if (!hasLead && centerId) {
+        for (const member of renderedMembers) {
+          const id = asString(member && member.id)
+          if (id && id !== centerId) addEdge(centerId, id, 'lead', 1, null)
+        }
+      }
+      const messageIn = new Map()
+      const messageOut = new Map()
+      for (const edge of edges) {
+        if (edge.kind !== 'message') continue
+        messageIn.set(edge.to, (messageIn.get(edge.to) || 0) + edge.weight)
+        messageOut.set(edge.from, (messageOut.get(edge.from) || 0) + edge.weight)
+      }
+      return {
+        edges,
+        messageIn: (id) => messageIn.get(id) || 0,
+        messageOut: (id) => messageOut.get(id) || 0,
+      }
+    }
+
+    function isRecentEdge(edge, now) {
+      const lastAt = asNumber(edge && edge.lastAt)
+      return lastAt !== null && now - lastAt <= EDGE_RECENT_MS
+    }
+
+    /** Quadratic curve between two node centres; bendRatio 0 = straight. */
+    function curvedEdgePath(from, to, bendRatio, direction) {
+      const dx = to.x - from.x
+      const dy = to.y - from.y
+      const distance = Math.hypot(dx, dy) || 1
+      const midX = (from.x + to.x) / 2
+      const midY = (from.y + to.y) / 2
+      const normalX = (-dy / distance) * direction
+      const normalY = (dx / distance) * direction
+      const bend = distance * bendRatio
+      return `M ${from.x} ${from.y} Q ${midX + normalX * bend} ${midY + normalY * bend} ${to.x} ${to.y}`
+    }
+
+    function edgeStrokeWidth(edge) {
+      if (!edge || edge.kind !== 'message') return 1
+      return Math.round((1 + Math.min(3, Math.sqrt(edge.weight))) * 100) / 100
     }
 
     /** Log scale against the team max: members without tokens keep RADIUS_MIN. */
@@ -604,9 +694,85 @@ window.__ModuleLoader__.load({
       return asString(role) === 'lead' ? t('member.role.lead') : t('member.role.teammate')
     }
 
-    function initialOf(name) {
-      const characters = Array.from(asString(name).trim())
-      return characters.length > 0 ? characters[0] : '?'
+    /* ------------------------------------------------------------------ */
+    /* Deterministic pixel-art characters (theme-token palette)            */
+    /* ------------------------------------------------------------------ */
+
+    const PIXEL_BASE_ROWS = [
+      '..........',
+      '..HHHHHH..',
+      '.HHHHHHHH.',
+      '.HSSSSSSH.',
+      '.HSESSESH.',
+      '.HSSSSSSH.',
+      '..SSSSSS..',
+      '.TTTTTTTT.',
+      'STTTTTTTTS',
+      '.TTTTTTTT.',
+      '.PPPPPPPP.',
+      '.PP....PP.',
+    ]
+
+    const PIXEL_CLASSES = {
+      H: 'hair',
+      S: 'skin',
+      E: 'eye',
+      P: 'pants',
+    }
+
+    /** FNV-1a-ish 32-bit string hash; deterministic per member. */
+    function hashString(value) {
+      const text = asString(value)
+      let hash = 2166136261
+      for (let index = 0; index < text.length; index += 1) {
+        hash ^= text.charCodeAt(index)
+        hash = Math.imul(hash, 16777619)
+      }
+      return hash >>> 0
+    }
+
+    /**
+     * One deterministic 10x12 pixel character. H hair, S skin, E eye, T shirt,
+     * A accent, P pants; every row is fixed-width. The Lead always wears the
+     * brand-token shirt and a brand accent marker (crown).
+     */
+    function pixelCharacter(member) {
+      const isLead = asString(member && member.role) === 'lead'
+      const hash = hashString(asString(member && member.id) + '|' + asString(member && member.name))
+      const rows = PIXEL_BASE_ROWS.slice()
+      const hairStyle = hash % 3
+      if (hairStyle === 1) {
+        rows[1] = '.HHHHHHHH.'
+        rows[2] = 'HHHHHHHHHH'
+      } else if (hairStyle === 2) {
+        rows[1] = '..HHHHHH..'
+        rows[2] = '..HHHHHH..'
+        rows[3] = '.HHSSSSHH.'
+      }
+      const accessory = isLead ? 0 : (hash >>> 3) % 3
+      if (accessory === 0) {
+        rows[0] = '..AAAAAA..'
+      } else if (accessory === 1) {
+        rows[7] = '.TTAAATTT.'
+      } else {
+        rows[8] = 'STTTATTTTS'
+      }
+      const shirtClass = isLead ? 'shirt-lead' : 'shirt-' + (hash % 4)
+      const accentClass = isLead ? 'accent-lead' : 'accent'
+      const pixels = []
+      for (let y = 0; y < rows.length; y += 1) {
+        const row = rows[y]
+        for (let x = 0; x < row.length; x += 1) {
+          const token = row[x]
+          if (token === '.') continue
+          let pixelClass
+          if (token === 'T') pixelClass = shirtClass
+          else if (token === 'A') pixelClass = accentClass
+          else pixelClass = PIXEL_CLASSES[token] || 'hair'
+          pixels.push({ x, y, c: pixelClass })
+        }
+      }
+      return pixels
     }
 
     /* ------------------------------------------------------------------ */
@@ -717,31 +883,53 @@ window.__ModuleLoader__.load({
 .atc-donut{display:block;flex:none;}
 .atc-donut-track{stroke:var(--dsw-alias-border-l2);}
 .atc-donut-arc{stroke:var(--dsw-alias-state-success-primary);stroke-linecap:round;transition:stroke-dasharray 300ms ease;}
-.atc-stage{position:relative;min-width:0;}
-.atc-stage-svg{display:block;width:100%;height:auto;max-height:180px;overflow:visible;}
-.atc-stage-line{stroke:var(--dsw-alias-border-l1);stroke-width:1;}
+.atc-graph{position:relative;display:flex;flex-direction:column;gap:6px;min-width:0;}
+.atc-graph-svg{display:block;width:100%;height:auto;max-height:520px;overflow:visible;}
+.atc-graph-legend{display:flex;flex-wrap:wrap;align-items:center;gap:12px;font-size:11px;line-height:15px;color:var(--dsw-alias-label-secondary);}
+.atc-legend-item{display:inline-flex;align-items:center;gap:5px;white-space:nowrap;}
+.atc-legend-swatch{display:inline-block;width:16px;height:0;border-top:1px solid var(--dsw-alias-border-l2);}
+.atc-legend-lead{border-top-color:var(--dsw-alias-border-l2);}
+.atc-legend-message{border-top-color:var(--dsw-alias-brand-primary);border-top-style:dashed;}
+.atc-edge{fill:none;stroke-linecap:round;}
+.atc-edge-lead{stroke:var(--dsw-alias-border-l2);opacity:0.4;}
+.atc-edge-message{stroke:var(--dsw-alias-brand-primary);opacity:0.45;}
+.atc-edge-faint{opacity:0.28;}
+.atc-edge-recent{opacity:0.9;stroke-dasharray:5 7;animation:atc-edge-flow 1.1s linear infinite;}
 .atc-node{outline:none;}
 .atc-node-clickable{cursor:pointer;}
 .atc-node-track{stroke:var(--dsw-alias-border-l2);stroke-width:3;}
 .atc-node-arc{stroke:var(--dsw-alias-state-success-primary);stroke-width:3;stroke-linecap:round;transition:stroke-dasharray 300ms ease;}
-.atc-node-avatar{fill:var(--dsw-alias-bg-layer-2);stroke:var(--dsw-alias-border-l1);stroke-width:1.5;}
-.atc-node-avatar-lead{stroke:var(--dsw-alias-brand-primary);stroke-width:2.5;}
-.atc-node-initial{fill:var(--dsw-alias-label-primary);font-size:12px;font-weight:600;text-anchor:middle;dominant-baseline:central;}
+.atc-node-hit{fill:var(--dsw-alias-bg-layer-1);opacity:0;pointer-events:all;}
 .atc-node-name{fill:var(--dsw-alias-label-primary);font-size:11.5px;text-anchor:middle;}
 .atc-node-stat{fill:var(--dsw-alias-label-secondary);font-size:10px;text-anchor:middle;font-variant-numeric:tabular-nums;}
 .atc-focus-ring{fill:none;stroke:var(--dsw-alias-brand-primary);stroke-width:1.5;opacity:0;pointer-events:none;}
 .atc-node:hover .atc-focus-ring{opacity:1;stroke:var(--dsw-alias-border-l2);}
 .atc-node:focus-visible .atc-focus-ring{opacity:1;stroke:var(--dsw-alias-brand-primary);}
-.atc-node-pulse{fill:none;stroke:var(--dsw-alias-state-success-primary);stroke-width:2;opacity:0;transform-box:fill-box;transform-origin:center;}
-.atc-node-running .atc-node-pulse{animation:atc-node-pulse 1.8s ease-out infinite;}
-.atc-node-orbit{transform-box:fill-box;transform-origin:center;}
-.atc-node-orbit-dot{fill:var(--dsw-alias-state-success-primary);}
-.atc-node-running .atc-node-orbit{animation:atc-orbit 2.6s linear infinite;}
 .atc-node-dash{fill:none;stroke:var(--dsw-alias-state-warn-primary);stroke-width:2;stroke-dasharray:4 5;opacity:0.9;transform-box:fill-box;transform-origin:center;}
-.atc-node-provisioning .atc-node-dash{animation:atc-orbit 6s linear infinite;}
+.atc-node-provisioning .atc-node-dash{animation:atc-ring-spin 6s linear infinite;}
 .atc-node-fail{fill:none;stroke:var(--dsw-alias-state-error-primary);stroke-width:2.5;}
-.atc-node-idle{opacity:0.65;}
-.atc-node-overflow .atc-node-avatar{stroke:var(--dsw-alias-border-l2);}
+.atc-node-idle{opacity:0.7;}
+.atc-node-overflow-ring{fill:var(--dsw-alias-bg-layer-1);stroke:var(--dsw-alias-border-l2);stroke-width:1;stroke-dasharray:3 3;}
+.atc-node-overflow-label{fill:var(--dsw-alias-label-secondary);font-size:11px;font-weight:600;text-anchor:middle;dominant-baseline:central;}
+.atc-char{transform-box:fill-box;transform-origin:center;pointer-events:none;}
+.atc-char-body,.atc-char-spark{pointer-events:none;}
+.atc-px{shape-rendering:crispEdges;}
+.atc-px-hair{fill:var(--dsw-alias-label-primary);}
+.atc-px-skin{fill:var(--dsw-alias-label-secondary);}
+.atc-px-eye{fill:var(--dsw-alias-bg-base);}
+.atc-px-pants{fill:var(--dsw-alias-state-idle-primary);}
+.atc-px-shirt-0{fill:var(--dsw-alias-state-idle-primary);}
+.atc-px-shirt-1{fill:var(--dsw-alias-state-success-primary);}
+.atc-px-shirt-2{fill:var(--dsw-alias-state-warn-primary);}
+.atc-px-shirt-3{fill:var(--dsw-alias-bg-overlay);}
+.atc-px-shirt-lead{fill:var(--dsw-alias-brand-primary);}
+.atc-px-accent{fill:var(--dsw-alias-label-primary);}
+.atc-px-accent-lead{fill:var(--dsw-alias-brand-primary);}
+.atc-spark{fill:var(--dsw-alias-state-success-primary);}
+.atc-char-spark{opacity:0;}
+.atc-node-running .atc-char{animation:atc-char-bob 1.6s ease-in-out infinite alternate;}
+.atc-node-running .atc-char-spark{animation:atc-char-spark 0.9s steps(1,end) infinite;}
+.atc-node-provisioning .atc-char{animation:atc-soft-blink 2.2s ease-in-out infinite;}
 .atc-detail{display:flex;flex-direction:column;gap:6px;padding:8px 10px;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;background:var(--dsw-alias-bg-base);}
 .atc-detail-head{display:flex;align-items:center;gap:6px;font-size:12px;line-height:16px;font-weight:600;}
 .atc-detail-name{color:var(--dsw-alias-label-primary);}
@@ -749,6 +937,7 @@ window.__ModuleLoader__.load({
 .atc-detail-row{display:flex;align-items:baseline;justify-content:space-between;gap:8px;font-size:11px;line-height:16px;}
 .atc-detail-label{color:var(--dsw-alias-label-secondary);}
 .atc-detail-value{color:var(--dsw-alias-label-primary);font-variant-numeric:tabular-nums;}
+.atc-detail-edges{font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary);font-variant-numeric:tabular-nums;}
 .atc-mstatus{display:inline-flex;align-items:center;gap:4px;font-size:11px;line-height:14px;color:var(--dsw-alias-label-secondary);}
 .atc-mdot{width:6px;height:6px;border-radius:50%;background:currentColor;flex:none;}
 .atc-mstatus-running{color:var(--dsw-alias-state-success-primary);}
@@ -770,14 +959,17 @@ window.__ModuleLoader__.load({
 .atc-empty-line{padding:2px;font-size:12px;line-height:17px;color:var(--dsw-alias-label-secondary);}
 .atc-skel{display:flex;flex-direction:column;gap:10px;animation:atc-breathe 1.6s ease-in-out infinite;}
 .atc-skel-strip{height:36px;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-layer-1);}
-.atc-skel-stage{height:176px;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-layer-1);}
+.atc-skel-graph{height:320px;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-layer-1);}
 .atc-skel-line{height:34px;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;background:var(--dsw-alias-bg-layer-1);}
 .atc-sr-only{position:absolute;width:1px;height:1px;margin:-1px;padding:0;border:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;}
 @keyframes atc-pulse{0%,100%{opacity:1;}50%{opacity:0.35;}}
 @keyframes atc-rotate{from{transform:rotate(0deg);}to{transform:rotate(360deg);}}
 @keyframes atc-breathe{0%,100%{opacity:1;}50%{opacity:0.55;}}
-@keyframes atc-orbit{from{transform:rotate(0deg);}to{transform:rotate(360deg);}}
-@keyframes atc-node-pulse{0%{transform:scale(1);opacity:0.55;}70%,100%{transform:scale(1.25);opacity:0;}}
+@keyframes atc-ring-spin{from{transform:rotate(0deg);}to{transform:rotate(360deg);}}
+@keyframes atc-char-bob{from{transform:translateY(0);}to{transform:translateY(-2.5px);}}
+@keyframes atc-char-spark{0%,49%{opacity:0;}50%,100%{opacity:1;}}
+@keyframes atc-soft-blink{0%,100%{opacity:1;}50%{opacity:0.55;}}
+@keyframes atc-edge-flow{from{stroke-dashoffset:12;}to{stroke-dashoffset:0;}}
 @media (max-width:899px){
 .atc-page{padding:14px 14px 32px;gap:12px;}
 .atc-header-side{width:100%;}
@@ -786,8 +978,8 @@ window.__ModuleLoader__.load({
 .atc-detail-grid{grid-template-columns:repeat(auto-fill,minmax(130px,1fr));}
 }
 @media (prefers-reduced-motion:reduce){
-.atc-pulse,.atc-spin,.atc-skel,.atc-node-pulse,.atc-node-orbit,.atc-node-dash,.atc-donut-arc,.atc-caret{animation:none !important;transition:none !important;}
-.atc-node-pulse,.atc-node-orbit{display:none;}
+.atc-pulse,.atc-spin,.atc-skel,.atc-node-dash,.atc-char,.atc-char-spark,.atc-edge-recent,.atc-donut-arc,.atc-caret{animation:none !important;transition:none !important;}
+.atc-char-spark{display:none;}
 }
 `
 
@@ -1139,7 +1331,7 @@ window.__ModuleLoader__.load({
     function Skeleton() {
       return h('div', { className: 'atc-skel', 'aria-hidden': 'true' },
         h('div', { className: 'atc-skel-strip' }),
-        h('div', { className: 'atc-skel-stage' }),
+        h('div', { className: 'atc-skel-graph' }),
         h('div', { className: 'atc-skel-line' }))
     }
 
@@ -1172,10 +1364,29 @@ window.__ModuleLoader__.load({
     }
 
     /* ------------------------------------------------------------------ */
-    /* Agent stage: one animated SVG node per member                       */
+    /* Agent graph: Lead hub + member ring, pixel-art characters, edges    */
     /* ------------------------------------------------------------------ */
 
-    function MemberDetail({ member, stats, t }) {
+    function PixelCharacter({ member }) {
+      const pixels = pixelCharacter(member)
+      const offsetX = -(PIXEL_GRID_WIDTH * PIXEL_SIZE) / 2
+      const offsetY = -(PIXEL_GRID_HEIGHT * PIXEL_SIZE) / 2
+      return h('g', { className: 'atc-char' },
+        h('g', { className: 'atc-char-body' }, pixels.map((pixel) => h('rect', {
+          key: pixel.x + '-' + pixel.y,
+          className: 'atc-px atc-px-' + pixel.c,
+          x: offsetX + pixel.x * PIXEL_SIZE,
+          y: offsetY + pixel.y * PIXEL_SIZE,
+          width: PIXEL_SIZE,
+          height: PIXEL_SIZE,
+        }))),
+        h('g', { className: 'atc-char-spark' },
+          h('rect', { className: 'atc-spark', x: 9, y: -2, width: 2, height: 2 }),
+          h('rect', { className: 'atc-spark', x: 12, y: 1, width: 2, height: 2 }),
+          h('rect', { className: 'atc-spark', x: 7, y: -6, width: 2, height: 2 })))
+    }
+
+    function MemberDetail({ member, stats, edges, t }) {
       const name = asString(member && member.name) || '—'
       const status = asString(member && member.status) || 'inactive'
       const tone = memberStatusTone(status)
@@ -1205,10 +1416,11 @@ window.__ModuleLoader__.load({
         h('div', { className: 'atc-detail-grid' },
           rows.map((row) => h('div', { key: row.key, className: 'atc-detail-row' },
             h('span', { className: 'atc-detail-label' }, row.label),
-            h('span', { className: 'atc-detail-value' }, row.value)))))
+            h('span', { className: 'atc-detail-value' }, row.value)))),
+        edges ? h('div', { className: 'atc-detail-edges' }, edges) : null)
     }
 
-    function AgentStage({ members, t, onOpen }) {
+    function AgentGraph({ team, members, t, onOpen }) {
       const [activeId, setActiveId] = React.useState(null)
       const ordered = stageMembers(members)
       if (ordered.length === 0) return h('div', { className: 'atc-empty-line' }, t('roster.empty'))
@@ -1222,42 +1434,92 @@ window.__ModuleLoader__.load({
         const stats = memberStatsFor(member)
         if (stats.tokens && stats.tokens.total > maxTokens) maxTokens = stats.tokens.total
       }
-      const total = shown.length + (overflow > 0 ? 1 : 0)
-      const width = Math.max(STAGE_MIN_WIDTH, 64 + Math.max(0, total - 1) * NODE_GAP)
-      const step = NODE_GAP
-      const startX = width / 2 - (Math.max(0, total - 1) * step) / 2
+      const graph = teamGraphEdges(team, shown)
+      const ringCount = Math.max(0, shown.length - 1) + (overflow > 0 ? 1 : 0)
+      const ringRadius = ringCount > 0 ? Math.max(GRAPH_MIN_RADIUS, GRAPH_SLOT * ringCount) : 0
+      const width = ringCount > 0 ? 2 * (ringRadius + GRAPH_PAD_X) : 2 * (GRAPH_PAD_X + 40)
+      const height = ringCount > 0 ? 2 * (ringRadius + GRAPH_PAD_Y) : 2 * (GRAPH_PAD_Y + 20)
+      const centerX = width / 2
+      const centerY = height / 2
       const hasLead = asString(shown[0] && shown[0].role) === 'lead'
+      const now = Date.now()
+      const nodeInfos = []
+      const nodeById = new Map()
+      for (let index = 0; index < shown.length; index += 1) {
+        const member = shown[index]
+        const id = asString(member && member.id)
+        const stats = memberStatsList[index]
+        const isCenter = index === 0
+        const isLead = isCenter && hasLead
+        const radius = nodeRadius(stats.tokens ? stats.tokens.total : null, maxTokens, isLead)
+        let x = centerX
+        let y = centerY
+        if (!isCenter && ringRadius > 0) {
+          const angle = -Math.PI / 2 + ((index - 1) * 2 * Math.PI) / Math.max(1, ringCount)
+          x = centerX + Math.cos(angle) * ringRadius
+          y = centerY + Math.sin(angle) * ringRadius
+        }
+        const info = { index, id, member, stats, radius, x, y, isCenter, isLead }
+        nodeInfos.push(info)
+        if (id) nodeById.set(id, info)
+      }
+      let overflowPosition = null
+      if (overflow > 0 && ringRadius > 0) {
+        const ringIndex = shown.length - 1
+        const angle = -Math.PI / 2 + (ringIndex * 2 * Math.PI) / Math.max(1, ringCount)
+        overflowPosition = {
+          x: centerX + Math.cos(angle) * ringRadius,
+          y: centerY + Math.sin(angle) * ringRadius,
+        }
+      }
       const activeMember = activeId
         ? shown.find((member) => asString(member && member.id) === activeId) || null
         : null
-      const elements = []
-      if (total > 0) {
-        elements.push(h('line', {
-          key: 'connector',
-          className: 'atc-stage-line',
-          x1: startX,
-          y1: STAGE_CENTER_Y,
-          x2: startX + Math.max(0, total - 1) * step,
-          y2: STAGE_CENTER_Y,
+      const activeEdges = activeMember
+        ? t('team.edgeSummary', {
+          in: graph.messageIn(asString(activeMember.id)),
+          out: graph.messageOut(asString(activeMember.id)),
+        })
+        : ''
+      const edgeElements = []
+      const sortedEdges = graph.edges.slice().sort((left, right) => (
+        (left.kind === 'lead' ? 0 : 1) - (right.kind === 'lead' ? 0 : 1)
+      ))
+      for (let index = 0; index < sortedEdges.length; index += 1) {
+        const edge = sortedEdges[index]
+        const from = nodeById.get(edge.from)
+        const to = nodeById.get(edge.to)
+        if (!from || !to) continue
+        const recent = edge.kind === 'message' && isRecentEdge(edge, now)
+        const direction = hashString(edge.from + '>' + edge.to) % 2 === 0 ? 1 : -1
+        edgeElements.push(h('path', {
+          key: edge.kind + '-' + index + '-' + edge.from + '-' + edge.to,
+          className: 'atc-edge atc-edge-' + edge.kind
+            + (edge.kind === 'message' ? (recent ? ' atc-edge-recent' : ' atc-edge-faint') : ''),
+          d: curvedEdgePath(from, to, edge.kind === 'lead' ? 0.07 : 0.18, direction),
+          strokeWidth: edgeStrokeWidth(edge),
+          'aria-hidden': 'true',
         }))
       }
-      for (let index = 0; index < shown.length; index += 1) {
-        const member = shown[index]
-        const stats = memberStatsList[index]
-        const id = asString(member && member.id)
+      const nodeElements = []
+      const labelElements = []
+      const buildNode = (info) => {
+        const { id, member, stats, radius, x, y, isCenter, isLead, index } = info
         const name = asString(member && member.name) || t('team.unnamed')
         const status = asString(member && member.status) || 'inactive'
         const tone = memberStatusTone(status)
         const nodeTone = tone === 'inactive' ? 'idle' : tone
-        const isLead = index === 0 && hasLead
-        const radius = nodeRadius(stats.tokens ? stats.tokens.total : null, maxTokens, isLead)
-        const centerX = startX + index * step
         const statusLabel = memberStatusLabel(status, t)
+        const edgesText = t('team.edgeSummary', {
+          in: graph.messageIn(id),
+          out: graph.messageOut(id),
+        })
         const nodeAria = t('team.nodeAria', {
           name,
           status: statusLabel,
           turns: stats.turns !== null ? String(stats.turns) : '—',
           tokens: stats.tokens ? formatTokens(stats.tokens.total) : '—',
+          edges: edgesText,
         })
         const clickable = typeof onOpen === 'function' && id !== ''
         const showDetail = () => setActiveId(id || null)
@@ -1269,8 +1531,9 @@ window.__ModuleLoader__.load({
           key: id || 'member-' + index,
           className: 'atc-node atc-node-' + nodeTone
             + (isLead ? ' atc-node-lead' : '')
+            + (isCenter ? ' atc-node-hub' : '')
             + (clickable ? ' atc-node-clickable' : ''),
-          transform: `translate(${centerX} ${STAGE_CENTER_Y})`,
+          transform: `translate(${x} ${y})`,
           tabIndex: 0,
           role: clickable ? 'button' : 'group',
           'aria-label': nodeAria,
@@ -1289,6 +1552,7 @@ window.__ModuleLoader__.load({
           }
         }
         const art = [
+          h('circle', { key: 'hit', className: 'atc-node-hit', r: radius + 7, fill: 'none' }),
           h('circle', { key: 'track', className: 'atc-node-track', r: radius + 5, fill: 'none' }),
         ]
         if (stats.workingRatio !== null && stats.workingRatio > 0) {
@@ -1302,59 +1566,69 @@ window.__ModuleLoader__.load({
             transform: 'rotate(-90)',
           }))
         }
-        if (tone === 'running') {
-          art.push(h('circle', { key: 'pulse', className: 'atc-node-pulse', r: radius + 5, fill: 'none' }))
-          art.push(h('g', { key: 'orbit', className: 'atc-node-orbit' },
-            h('circle', { className: 'atc-node-orbit-keep', r: radius + 5, fill: 'none', stroke: 'none' }),
-            h('circle', { className: 'atc-node-orbit-dot', cx: 0, cy: -(radius + 5), r: 2.5 })))
-        } else if (tone === 'provisioning') {
+        if (tone === 'provisioning') {
           art.push(h('circle', { key: 'dash', className: 'atc-node-dash', r: radius + 5, fill: 'none' }))
         } else if (tone === 'failed') {
           art.push(h('circle', { key: 'fail', className: 'atc-node-fail', r: radius + 5, fill: 'none' }))
         }
         art.push(h('circle', { key: 'focus', className: 'atc-focus-ring', r: radius + 10, fill: 'none' }))
-        art.push(h('circle', {
-          key: 'avatar',
-          className: 'atc-node-avatar' + (isLead ? ' atc-node-avatar-lead' : ''),
-          r: radius,
-        }))
-        art.push(h('text', { key: 'initial', className: 'atc-node-initial', y: 0.5 }, initialOf(name)))
-        elements.push(h('g', nodeProps, art))
-        elements.push(h('text', {
+        art.push(h(PixelCharacter, { key: 'character', member }))
+        nodeElements.push(h('g', nodeProps, art))
+        labelElements.push(h('text', {
           key: 'name-' + index,
           className: 'atc-node-name',
-          x: centerX,
-          y: STAGE_NAME_Y,
+          x,
+          y: y + radius + 17,
         }, truncateText(name, 12)))
-        elements.push(h('text', {
+        labelElements.push(h('text', {
           key: 'stat-' + index,
           className: 'atc-node-stat',
-          x: centerX,
-          y: STAGE_STAT_Y,
+          x,
+          y: y + radius + 31,
         }, memberStatLine(stats, t)))
       }
-      if (overflow > 0) {
-        const centerX = startX + shown.length * step
-        const overflowLabel = t('team.moreMembers', { n: overflow })
-        elements.push(h('g', {
+      // Hub first so keyboard order follows the member order (lead first);
+      // nodes never overlap, so paint order does not matter.
+      for (let index = 0; index < nodeInfos.length; index += 1) buildNode(nodeInfos[index])
+      if (overflow > 0 && overflowPosition !== null) {
+        nodeElements.push(h('g', {
           key: 'overflow',
           className: 'atc-node atc-node-overflow',
-          transform: `translate(${centerX} ${STAGE_CENTER_Y})`,
+          transform: `translate(${overflowPosition.x} ${overflowPosition.y})`,
           role: 'img',
-          'aria-label': overflowLabel,
+          'aria-label': t('team.overflow', { n: overflow }),
         },
-          h('circle', { className: 'atc-node-track', r: RADIUS_MIN + 5, fill: 'none' }),
-          h('circle', { className: 'atc-node-avatar', r: RADIUS_MIN }),
-          h('text', { className: 'atc-node-initial', y: 0.5 }, '+' + overflow)))
+          h('circle', { className: 'atc-node-overflow-ring', r: RADIUS_MIN + 5, fill: 'none' }),
+          h('text', { className: 'atc-node-overflow-label' }, '+' + overflow)))
       }
-      return h('div', { className: 'atc-stage' },
+      const hasMessageEdges = graph.edges.some((edge) => edge.kind === 'message')
+      return h('div', { className: 'atc-graph' },
+        ringCount > 0
+          ? h('div', { className: 'atc-graph-legend' },
+            h('span', { className: 'atc-legend-item' },
+              h('span', { className: 'atc-legend-swatch atc-legend-lead', 'aria-hidden': 'true' }),
+              t('team.edgeLead')),
+            hasMessageEdges
+              ? h('span', { className: 'atc-legend-item' },
+                h('span', { className: 'atc-legend-swatch atc-legend-message', 'aria-hidden': 'true' }),
+                t('team.edgeMessage'))
+              : null)
+          : null,
         h('svg', {
-          className: 'atc-stage-svg',
-          viewBox: `0 0 ${width} ${STAGE_HEIGHT}`,
+          className: 'atc-graph-svg',
+          viewBox: `0 0 ${width} ${height}`,
           role: 'group',
-          'aria-label': t('team.stageLabel', { n: ordered.length }),
-        }, elements),
-        activeMember ? h(MemberDetail, { key: 'detail', member: activeMember, stats: memberStatsFor(activeMember), t }) : null)
+          'aria-label': t('team.graphLabel', { n: ordered.length }),
+        }, edgeElements.concat(nodeElements, labelElements)),
+        activeMember
+          ? h(MemberDetail, {
+            key: 'detail',
+            member: activeMember,
+            stats: memberStatsFor(activeMember),
+            edges: activeEdges,
+            t,
+          })
+          : null)
     }
 
     /* ------------------------------------------------------------------ */
@@ -1466,7 +1740,7 @@ window.__ModuleLoader__.load({
         errorMessage ? h('div', { className: 'atc-team-error', role: 'alert' }, t('team.error', { message: errorMessage })) : null,
         expanded
           ? h('div', { className: 'atc-team-body', id: bodyId },
-            h(AgentStage, { members, t, onOpen }),
+            h(AgentGraph, { team: safe, members, t, onOpen }),
             h(TasksSummary, { team: safe, counts, t, expanded: tasksExpanded, onToggle: onToggleTasks }))
           : null)
     }
