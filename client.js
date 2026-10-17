@@ -1,5 +1,5 @@
 /**
- * dsh-agent-team-console — Client half (browser bundle), snapshot contract v2.
+ * dsh-agent-team-console — Client half (browser bundle), snapshot contract v3.
  * ============================================================================
  * Self-registering classic script loaded through window.__ModuleLoader__:
  *   - id MUST equal the package name.
@@ -7,12 +7,16 @@
  *   - Registers a sidebar.panellist entry (id 'team-console') and a keyed
  *     main panel (key 'team-console') that polls the Host half at
  *     GET /api/team-console/snapshot (same origin, read-only, 2s cadence).
- *   - Read-only, in-progress-first design (contract v1.1.0):
+ *   - Read-only, visual-first design (1.2.0 / contract v3):
  *       header (project filter, live dot, refresh)
- *       -> compact status chip strip (in-progress / running / blocked / pending)
- *       -> per-team section (active expanded, idle collapsed): roster chips,
- *          in-progress task cards, compact pending rows, collapsed completed
- *          group, compact activity list.
+ *       -> compact status chip strip (in-progress / running / tokens / blocked / pending)
+ *       -> per-team section (active expanded, idle collapsed) whose header starts
+ *          with the workspace/project name and carries the working-vs-idle donut
+ *          and stats, and whose body is an animated SVG "agent stage" (one node
+ *          per member: tokens-scaled avatar, working-ratio ring, status motion)
+ *          plus a collapsed task summary line with in-progress rows on demand.
+ *     The activity timeline is intentionally not rendered (contract keeps it for
+ *     API consumers); stats come from the contract v3 `team.stats` / `member.stats`.
  *   - All copy is bilingual through the Client locale service under the
  *     namespace 'agent-team-console' (zh + en kept key-for-key in sync); the
  *     Chinese dictionary is primary and the English one mirrors it.
@@ -30,8 +34,16 @@ window.__ModuleLoader__.load({
     const NS = 'agent-team-console'
     const API = '/api/team-console/snapshot'
     const POLL_MS = 2000
-    const ACTIVITY_LIMIT = 8
     const MEMBER_LIMIT = 8
+    const NODE_GAP = 96
+    const STAGE_MIN_WIDTH = 340
+    const STAGE_HEIGHT = 140
+    const STAGE_CENTER_Y = 60
+    const STAGE_NAME_Y = 106
+    const STAGE_STAT_Y = 120
+    const RADIUS_MIN = 16
+    const RADIUS_MAX = 26
+    const LEAD_RADIUS_BONUS = 2
 
     /* ------------------------------------------------------------------ */
     /* Locale dictionaries (zh + en, identical key sets)                   */
@@ -40,7 +52,7 @@ window.__ModuleLoader__.load({
     const zh = {
       'panel.label': '团队看板',
       title: 'Agent Team 看板',
-      subtitle: '按项目查看进行中的工作、成员与协作动态',
+      subtitle: '实时舞台：每个 Agent 的状态、轮次与 Token 用量',
       live: '实时 · {interval}',
       refresh: '刷新',
       refreshing: '正在刷新',
@@ -53,76 +65,68 @@ window.__ModuleLoader__.load({
       'unsupported.title': 'Agent Teams 服务未挂载',
       'unsupported.body': '当前运行环境没有提供 Agent Teams 服务：{message}',
       'empty.title': '还没有正在运行的 Agent Team',
-      'empty.body': '在会话中创建队友或共享任务后，它们会自动出现在这里；空闲的团队也会保留在列表中。本页是只读视图，不会修改任何团队状态。',
+      'empty.body': '在会话中创建队友或共享任务后，它们会自动出现在这里；空闲的团队也会保留在列表中（默认折叠）。本页是只读视图，不会修改任何团队状态。',
       'empty.unsupported': '当前 profile 未提供 Agent Teams 服务，因此这里不会列出任何团队。',
       'filter.label': '按项目筛选',
       'filter.all': '全部项目',
-      'project.none': '未归属项目',
+      'project.none': '未分组',
       'stat.inProgress': '进行中任务',
       'stat.runningMembers': '运行成员',
+      'stat.tokens': 'Token 用量',
       'stat.blocked': '阻塞任务',
       'stat.pending': '待处理任务',
-      'section.inProgress': '进行中',
-      'section.pending': '待处理',
-      'section.completed': '已完成',
-      'section.roster': '成员',
-      'section.activity': '最新动态',
-      'team.idle': '空闲',
+      'team.turns': '{n} 轮',
+      'team.tokens': '{n} tok',
+      'team.work': '工作',
+      'team.idle': '闲置',
+      'team.workIdle': '{work} · {idle}',
+      'team.inProgress': '进行中 {n}',
       'team.expand': '展开',
       'team.collapse': '收起',
       'team.unnamed': '未命名团队',
       'team.error': '团队数据读取失败：{message}',
-      'team.members': '成员 {n}',
-      'team.inProgress': '进行中 {n}',
-      'team.blocked': '阻塞 {n}',
-      'roster.empty': '暂无成员',
-      'roster.more': '另有 {n}',
+      'team.stageLabel': '{n} 位成员的实时状态',
+      'team.nodeAria': '{name}，{status}，{turns}，{tokens}',
+      'team.statLine': '{turns} · {tokens}',
+      'team.moreMembers': '另有 {n} 位成员',
       'member.role.lead': 'Lead',
       'member.role.teammate': 'Teammate',
       'member.status.running': '运行中',
       'member.status.inactive': '未运行',
       'member.status.provisioning': '准备中',
       'member.status.failed': '失败',
-      'member.open': '打开成员会话',
-      'status.pending': '待处理',
-      'status.in_progress': '进行中',
-      'status.completed': '已完成',
+      'tooltip.model': '模型',
+      'tooltip.turns': '轮次',
+      'tooltip.steps': '步骤',
+      'tooltip.tokens': '合计',
+      'tooltip.input': '未缓存输入',
+      'tooltip.cacheRead': '缓存读取',
+      'tooltip.cacheWrite': '缓存写入',
+      'tooltip.output': '输出',
+      'tooltip.working': '工作时间',
+      'tooltip.idle': '闲置时间',
+      'roster.empty': '暂无成员',
+      'tasks.summary': '{inProgress} · {pending} · {blocked}',
+      'tasks.inProgress': '进行中 {n}',
+      'tasks.pending': '待办 {n}',
+      'tasks.blocked': '阻塞 {n}',
+      'tasks.toggle': '展开或收起进行中任务',
+      'tasks.noInProgress': '暂无进行中的任务',
+      'section.inProgress': '进行中',
       'task.owner': '负责人：{name}',
       'task.unowned': '未分配',
-      'task.ready': '可开始',
-      'task.blocked': '被依赖阻塞',
-      'task.blockedBy': '被 {ids} 阻塞',
-      'task.scopesLabel': '写入范围',
-      'task.expand': '展开说明',
-      'task.collapse': '收起说明',
-      'tasks.empty': '还没有共享任务',
-      'tasks.noInProgress': '暂无进行中的任务',
-      'tasks.completedCount': '已完成 {n}',
-      'tasks.completedToggle': '展开或收起已完成任务',
-      'activity.empty': '暂无最近动态',
-      'activity.unknown': '未知动态',
-      'action.spawn': '创建',
-      'action.create': '创建',
-      'action.claim': '认领',
-      'action.complete': '完成',
-      'action.update': '更新',
-      'action.release': '释放',
-      'action.assign': '分配',
-      'action.delete': '删除',
-      'action.start': '开始',
-      'action.fail': '失败',
-      'action.reopen': '重新打开',
-      'time.justNow': '刚刚',
-      'time.seconds': '{n} 秒前',
-      'time.minutes': '{n} 分钟前',
-      'time.hours': '{n} 小时前',
-      'time.days': '{n} 天前',
+      'status.in_progress': '进行中',
+      'duration.seconds': '{n} 秒',
+      'duration.minutes': '{n} 分',
+      'duration.hours': '{n} 小时',
+      'duration.hoursMinutes': '{h} 小时 {m} 分',
+      'duration.days': '{n} 天',
     }
 
     const en = {
       'panel.label': 'Team console',
       title: 'Agent Team Console',
-      subtitle: 'In-progress work, members, and activity by project',
+      subtitle: 'A live stage of each agent‘s state, rounds, and token usage',
       live: 'Live · {interval}',
       refresh: 'Refresh',
       refreshing: 'Refreshing',
@@ -135,70 +139,62 @@ window.__ModuleLoader__.load({
       'unsupported.title': 'Agent Teams service is not mounted',
       'unsupported.body': 'The current runtime does not provide the Agent Teams service: {message}',
       'empty.title': 'No running Agent Team yet',
-      'empty.body': 'Teammates and shared tasks appear here automatically once you spawn them in a conversation; idle teams stay listed too. This page is read-only and never changes team state.',
+      'empty.body': 'Teammates and shared tasks appear here automatically once you spawn them in a conversation; idle teams stay listed too (collapsed by default). This page is read-only and never changes team state.',
       'empty.unsupported': 'The current profile does not provide the Agent Teams service, so no teams can be listed.',
       'filter.label': 'Filter by project',
       'filter.all': 'All projects',
-      'project.none': 'No project',
+      'project.none': 'Ungrouped',
       'stat.inProgress': 'In-progress tasks',
       'stat.runningMembers': 'Running members',
+      'stat.tokens': 'Token usage',
       'stat.blocked': 'Blocked tasks',
       'stat.pending': 'Pending tasks',
-      'section.inProgress': 'In progress',
-      'section.pending': 'Pending',
-      'section.completed': 'Completed',
-      'section.roster': 'Members',
-      'section.activity': 'Recent activity',
+      'team.turns': '{n} turns',
+      'team.tokens': '{n} tok',
+      'team.work': 'Work',
       'team.idle': 'Idle',
+      'team.workIdle': '{work} · {idle}',
+      'team.inProgress': '{n} in progress',
       'team.expand': 'Expand',
       'team.collapse': 'Collapse',
       'team.unnamed': 'Unnamed team',
       'team.error': 'Team data could not be read: {message}',
-      'team.members': '{n} members',
-      'team.inProgress': '{n} in progress',
-      'team.blocked': '{n} blocked',
-      'roster.empty': 'No members',
-      'roster.more': '{n} more',
+      'team.stageLabel': 'Live status of {n} members',
+      'team.nodeAria': '{name}, {status}, {turns}, {tokens}',
+      'team.statLine': '{turns} · {tokens}',
+      'team.moreMembers': '{n} more members',
       'member.role.lead': 'Lead',
       'member.role.teammate': 'Teammate',
       'member.status.running': 'Running',
       'member.status.inactive': 'Idle',
       'member.status.provisioning': 'Provisioning',
       'member.status.failed': 'Failed',
-      'member.open': 'Open member conversation',
-      'status.pending': 'Pending',
-      'status.in_progress': 'In progress',
-      'status.completed': 'Completed',
+      'tooltip.model': 'Model',
+      'tooltip.turns': 'Rounds',
+      'tooltip.steps': 'Steps',
+      'tooltip.tokens': 'Total',
+      'tooltip.input': 'Uncached input',
+      'tooltip.cacheRead': 'Cache read',
+      'tooltip.cacheWrite': 'Cache write',
+      'tooltip.output': 'Output',
+      'tooltip.working': 'Working time',
+      'tooltip.idle': 'Idle time',
+      'roster.empty': 'No members',
+      'tasks.summary': '{inProgress} · {pending} · {blocked}',
+      'tasks.inProgress': '{n} in progress',
+      'tasks.pending': '{n} pending',
+      'tasks.blocked': '{n} blocked',
+      'tasks.toggle': 'Expand or collapse in-progress tasks',
+      'tasks.noInProgress': 'No task in progress',
+      'section.inProgress': 'In progress',
       'task.owner': 'Owner: {name}',
       'task.unowned': 'Unassigned',
-      'task.ready': 'Ready',
-      'task.blocked': 'Blocked by dependencies',
-      'task.blockedBy': 'Blocked by {ids}',
-      'task.scopesLabel': 'Write scopes',
-      'task.expand': 'Show description',
-      'task.collapse': 'Hide description',
-      'tasks.empty': 'No shared tasks yet',
-      'tasks.noInProgress': 'No task in progress',
-      'tasks.completedCount': 'Completed {n}',
-      'tasks.completedToggle': 'Expand or collapse completed tasks',
-      'activity.empty': 'No recent activity',
-      'activity.unknown': 'Unknown activity',
-      'action.spawn': 'spawned',
-      'action.create': 'created',
-      'action.claim': 'claimed',
-      'action.complete': 'completed',
-      'action.update': 'updated',
-      'action.release': 'released',
-      'action.assign': 'assigned',
-      'action.delete': 'deleted',
-      'action.start': 'started',
-      'action.fail': 'failed',
-      'action.reopen': 'reopened',
-      'time.justNow': 'just now',
-      'time.seconds': '{n}s ago',
-      'time.minutes': '{n}m ago',
-      'time.hours': '{n}h ago',
-      'time.days': '{n}d ago',
+      'status.in_progress': 'In progress',
+      'duration.seconds': '{n}s',
+      'duration.minutes': '{n}m',
+      'duration.hours': '{n}h',
+      'duration.hoursMinutes': '{h}h {m}m',
+      'duration.days': '{n}d',
     }
 
     /* ------------------------------------------------------------------ */
@@ -272,37 +268,64 @@ window.__ModuleLoader__.load({
       }
     }
 
-    function formatShortDate(ts) {
-      const value = asNumber(ts)
-      if (value === null) return '—'
-      try {
-        return new Date(value).toLocaleString(languageTag(), {
-          month: '2-digit',
-          day: '2-digit',
-          hour: '2-digit',
-          minute: '2-digit',
-          hour12: false,
-        })
-      } catch (error) {
-        return new Date(value).toISOString().slice(5, 16).replace('T', ' ')
-      }
+    function truncateText(value, max) {
+      const characters = Array.from(asString(value))
+      if (characters.length <= max) return characters.join('')
+      return characters.slice(0, Math.max(1, max - 1)).join('') + '…'
     }
 
-    function formatRelative(ts, t) {
-      const value = asNumber(ts)
-      if (value === null) return '—'
-      const diffMs = Date.now() - value
-      if (diffMs < 0) return t('time.justNow')
-      const seconds = Math.floor(diffMs / 1000)
-      if (seconds < 5) return t('time.justNow')
-      if (seconds < 60) return t('time.seconds', { n: seconds })
+    /** Compact token count: 950 -> 950, 12.3k, 1.2M, 3.4B. */
+    function formatTokens(value) {
+      const number = asNumber(value)
+      if (number === null) return '—'
+      const trim = (text) => (text.endsWith('.0') ? text.slice(0, -2) : text)
+      const absolute = Math.abs(number)
+      if (absolute < 10000) return String(Math.round(number))
+      const units = [
+        { scale: 1e9, suffix: 'B' },
+        { scale: 1e6, suffix: 'M' },
+        { scale: 1e3, suffix: 'k' },
+      ]
+      const index = units.findIndex((unit) => absolute >= unit.scale)
+      if (index < 0) return String(Math.round(number))
+      const rounded = Math.round((number / units[index].scale) * 10) / 10
+      // Promote on rounding so 999,950 renders as 1M rather than 1000k.
+      if (Math.abs(rounded) >= 1000 && index > 0) {
+        const promoted = units[index - 1]
+        return trim((number / promoted.scale).toFixed(1)) + promoted.suffix
+      }
+      return trim(rounded.toFixed(1)) + units[index].suffix
+    }
+
+    /** Compact duration from milliseconds: 45s, 12m, 2h 5m, 3d. */
+    function formatDuration(value, t) {
+      const milliseconds = asNumber(value)
+      if (milliseconds === null || milliseconds < 0) return '—'
+      const seconds = Math.floor(milliseconds / 1000)
+      if (seconds < 60) return t('duration.seconds', { n: seconds })
       const minutes = Math.floor(seconds / 60)
-      if (minutes < 60) return t('time.minutes', { n: minutes })
+      if (minutes < 60) return t('duration.minutes', { n: minutes })
       const hours = Math.floor(minutes / 60)
-      if (hours < 24) return t('time.hours', { n: hours })
-      const days = Math.floor(hours / 24)
-      if (days < 7) return t('time.days', { n: days })
-      return formatShortDate(value)
+      const restMinutes = minutes % 60
+      if (hours < 24) {
+        return restMinutes > 0
+          ? t('duration.hoursMinutes', { h: hours, m: restMinutes })
+          : t('duration.hours', { n: hours })
+      }
+      return t('duration.days', { n: Math.floor(hours / 24) })
+    }
+
+    function addNullable(total, value) {
+      if (value === null || value === undefined) return total
+      return total === null ? value : total + value
+    }
+
+    function ratioFrom(workingMs, idleMs) {
+      if (workingMs === null || idleMs === null) return null
+      const denominator = workingMs + idleMs
+      if (!(denominator > 0)) return null
+      const ratio = workingMs / denominator
+      return Math.min(1, Math.max(0, Math.round(ratio * 10000) / 10000))
     }
 
     function pathBasename(path) {
@@ -312,42 +335,101 @@ window.__ModuleLoader__.load({
       return parts[parts.length - 1] || raw
     }
 
-    function actionLabel(action, t) {
-      const raw = asString(action)
-      if (!raw) return ''
-      const key = 'action.' + raw
-      return hasKey(key) ? t(key) : raw
+    /* ------------------------------------------------------------------ */
+    /* Contract v3 stats (best effort; every field may be null)            */
+    /* ------------------------------------------------------------------ */
+
+    function readTokenStats(raw) {
+      if (!raw || typeof raw !== 'object') return null
+      const uncachedInput = asNumber(raw.uncachedInput)
+      const cacheRead = asNumber(raw.cacheRead)
+      const cacheWrite = asNumber(raw.cacheWrite)
+      const output = asNumber(raw.output)
+      const explicitTotal = asNumber(raw.total)
+      const known = [uncachedInput, cacheRead, cacheWrite, output].filter((value) => value !== null)
+      let total = explicitTotal
+      if (total === null) {
+        if (known.length === 0) return null
+        total = known.reduce((sum, value) => sum + value, 0)
+      }
+      return {
+        total,
+        uncachedInput: uncachedInput === null ? 0 : uncachedInput,
+        cacheRead: cacheRead === null ? 0 : cacheRead,
+        cacheWrite: cacheWrite === null ? 0 : cacheWrite,
+        output: output === null ? 0 : output,
+      }
     }
 
-    function memberStatusLabel(status, t) {
-      const raw = asString(status)
-      const key = 'member.status.' + raw
-      return raw && hasKey(key) ? t(key) : raw || '—'
+    function readStats(raw) {
+      const value = raw && typeof raw === 'object' ? raw : {}
+      const ratioValue = asNumber(value.workingRatio)
+      return {
+        turns: asNumber(value.turns),
+        steps: asNumber(value.steps),
+        tokens: readTokenStats(value.tokens),
+        llmMs: asNumber(value.llmMs),
+        toolMs: asNumber(value.toolMs),
+        workingMs: asNumber(value.workingMs),
+        idleMs: asNumber(value.idleMs),
+        wallMs: asNumber(value.wallMs),
+        workingRatio: ratioValue === null ? null : Math.min(1, Math.max(0, ratioValue)),
+        live: value.live === true,
+      }
     }
 
-    function memberStatusTone(status) {
-      const raw = asString(status)
-      if (raw === 'running') return 'running'
-      if (raw === 'provisioning') return 'provisioning'
-      if (raw === 'failed') return 'failed'
-      return 'inactive'
+    const STAT_NUMBER_KEYS = ['turns', 'steps', 'llmMs', 'toolMs', 'workingMs', 'idleMs', 'wallMs']
+
+    /** Sum the available numeric fields of several member stats rows. */
+    function combineStats(statsList) {
+      const totals = { tokens: null, workingRatio: null }
+      for (const key of STAT_NUMBER_KEYS) totals[key] = null
+      for (const stats of statsList) {
+        for (const key of STAT_NUMBER_KEYS) totals[key] = addNullable(totals[key], stats[key])
+        if (stats.tokens) {
+          if (totals.tokens === null) {
+            totals.tokens = { total: 0, uncachedInput: 0, cacheRead: 0, cacheWrite: 0, output: 0 }
+          }
+          totals.tokens.total += stats.tokens.total
+          totals.tokens.uncachedInput += stats.tokens.uncachedInput
+          totals.tokens.cacheRead += stats.tokens.cacheRead
+          totals.tokens.cacheWrite += stats.tokens.cacheWrite
+          totals.tokens.output += stats.tokens.output
+        }
+      }
+      totals.workingRatio = ratioFrom(totals.workingMs, totals.idleMs)
+      return totals
     }
 
-    function memberRoleLabel(role, t) {
-      return asString(role) === 'lead' ? t('member.role.lead') : t('member.role.teammate')
+    function teamStatsFor(team) {
+      const raw = team && typeof team.stats === 'object' && team.stats ? team.stats : null
+      if (raw) {
+        const stats = readStats(raw)
+        const hasAny = stats.turns !== null || stats.steps !== null || stats.tokens !== null
+          || stats.workingMs !== null || stats.idleMs !== null || stats.wallMs !== null
+        if (hasAny) return stats
+      }
+      // Defensive fallback for a v2 payload: aggregate the member stats we have.
+      return combineStats(asArray(team && team.members).map((member) => readStats(member && member.stats)))
+    }
+
+    function memberStatsFor(member) {
+      return readStats(member && member.stats)
+    }
+
+    function memberStatLine(stats, t) {
+      const turns = stats && stats.turns !== null ? t('team.turns', { n: stats.turns }) : '—'
+      const tokens = stats && stats.tokens ? t('team.tokens', { n: formatTokens(stats.tokens.total) }) : '—'
+      return t('team.statLine', { turns, tokens })
     }
 
     /* ------------------------------------------------------------------ */
     /* Snapshot aggregation helpers (defensive about every field)          */
     /*                                                                     */
-    /* Contract v2 semantics used below:                                   */
-    /*   - team.active === true when the team has provisioning/running     */
-    /*     members or in-progress tasks (host-computed, derived as a       */
-    /*     fallback for older snapshots).                                  */
-    /*   - member.active === running || provisioning; task.active ===      */
-    /*     status in_progress.                                             */
-    /*   - counts.idle = inactive members, counts.ready = ready pending    */
-    /*     tasks.                                                          */
+    /* Contract v3 semantics: `team.stats` / `member.stats` are best-effort */
+    /* and may be null. Readiness: only a pending task with ready === false */
+    /* is blocked; in-progress tasks always carry ready === false and are   */
+    /* claimed work, never blocked.                                        */
     /* ------------------------------------------------------------------ */
 
     function teamCounts(team) {
@@ -357,7 +439,7 @@ window.__ModuleLoader__.load({
       const membersBy = (status) => members.filter((member) => asString(member && member.status) === status).length
       const tasksBy = (status) => tasks.filter((task) => asString(task && task.status) === status).length
       const blockedTasks = tasks.filter((task) => (
-        asString(task && task.status) !== 'completed' && asArray(task && task.blockedBy).length > 0
+        asString(task && task.status) === 'pending' && task && task.ready === false
       )).length
       const readyTasks = tasks.filter((task) => (
         asString(task && task.status) === 'pending' && task && task.ready === true
@@ -392,13 +474,15 @@ window.__ModuleLoader__.load({
     }
 
     function aggregateTeams(teams) {
-      const totals = { teams: 0, activeTeams: 0 }
+      const totals = { teams: 0, activeTeams: 0, tokens: null }
       for (const key of TOTALS_KEYS) totals[key] = 0
       for (const team of asArray(teams)) {
         const counts = teamCounts(team)
+        const stats = teamStatsFor(team)
         totals.teams += 1
         if (teamActiveFromCounts(team, counts)) totals.activeTeams += 1
         for (const key of TOTALS_KEYS) totals[key] += counts[key]
+        if (stats.tokens) totals.tokens = (totals.tokens === null ? 0 : totals.tokens) + stats.tokens.total
       }
       return totals
     }
@@ -478,33 +562,51 @@ window.__ModuleLoader__.load({
       })
     }
 
-    function teamLatestTime(team) {
-      let latest = null
-      for (const member of asArray(team && team.members)) {
-        const value = asNumber(member && member.lastActivityAt)
-        if (value !== null && (latest === null || value > latest)) latest = value
+    /** The Lead node comes first; the remaining teammates keep the served order. */
+    function stageMembers(members) {
+      const list = asArray(members)
+      const lead = list.find((member) => asString(member && member.role) === 'lead') || null
+      const ordered = []
+      if (lead) ordered.push(lead)
+      for (const member of list) {
+        if (member !== lead) ordered.push(member)
       }
-      for (const item of asArray(team && team.activity)) {
-        const value = asNumber(item && item.time)
-        if (value !== null && (latest === null || value > latest)) latest = value
-      }
-      return latest
+      return ordered
     }
 
-    function memberRank(member) {
-      const status = asString(member && member.status)
-      if (status === 'running' || status === 'provisioning') return 0
-      if (status === 'inactive') return 1
-      if (status === 'failed') return 2
-      return 3
+    /** Log scale against the team max: members without tokens keep RADIUS_MIN. */
+    function nodeRadius(tokensTotal, maxTokens, isLead) {
+      let ratio = 0
+      if (tokensTotal !== null && tokensTotal > 0 && maxTokens > 0) {
+        ratio = Math.log1p(tokensTotal) / Math.log1p(maxTokens)
+        if (!Number.isFinite(ratio)) ratio = 0
+        ratio = Math.min(1, Math.max(0, ratio))
+      }
+      const radius = RADIUS_MIN + (RADIUS_MAX - RADIUS_MIN) * ratio + (isLead ? LEAD_RADIUS_BONUS : 0)
+      return Math.round(radius * 10) / 10
     }
 
-    /** Stable active-first ordering: running/provisioning, idle, failed. */
-    function sortMembers(members) {
-      return asArray(members)
-        .map((member, index) => ({ member, index }))
-        .sort((left, right) => (memberRank(left.member) - memberRank(right.member)) || (left.index - right.index))
-        .map((entry) => entry.member)
+    function memberStatusLabel(status, t) {
+      const raw = asString(status)
+      const key = 'member.status.' + raw
+      return raw && hasKey(key) ? t(key) : raw || '—'
+    }
+
+    function memberStatusTone(status) {
+      const raw = asString(status)
+      if (raw === 'running') return 'running'
+      if (raw === 'provisioning') return 'provisioning'
+      if (raw === 'failed') return 'failed'
+      return 'inactive'
+    }
+
+    function memberRoleLabel(role, t) {
+      return asString(role) === 'lead' ? t('member.role.lead') : t('member.role.teammate')
+    }
+
+    function initialOf(name) {
+      const characters = Array.from(asString(name).trim())
+      return characters.length > 0 ? characters[0] : '?'
     }
 
     /* ------------------------------------------------------------------ */
@@ -568,6 +670,7 @@ window.__ModuleLoader__.load({
 .atc-stat-label{color:var(--dsw-alias-label-secondary);}
 .atc-stat-inprogress .atc-stat-value{color:var(--dsw-alias-brand-primary);}
 .atc-stat-running .atc-stat-value{color:var(--dsw-alias-state-success-primary);}
+.atc-stat-tokens .atc-stat-value{color:var(--dsw-alias-label-primary);}
 .atc-stat-blocked .atc-stat-value{color:var(--dsw-alias-state-warn-primary);}
 .atc-stat-pending .atc-stat-value{color:var(--dsw-alias-label-secondary);}
 .atc-stat-zero .atc-stat-value{color:var(--dsw-alias-label-secondary);font-weight:500;}
@@ -597,100 +700,94 @@ window.__ModuleLoader__.load({
 .atc-teams{display:flex;flex-direction:column;gap:8px;min-width:0;}
 .atc-team{min-width:0;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-layer-1);}
 .atc-team-active{border-color:var(--dsw-alias-border-l2);}
-.atc-team-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;width:100%;padding:8px 12px;border:0;border-radius:10px;background:none;text-align:left;cursor:pointer;}
+.atc-team-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;width:100%;padding:9px 12px;border:0;border-radius:10px;background:none;text-align:left;cursor:pointer;}
 .atc-team-head:hover{background:var(--dsw-alias-bg-layer-2);}
 .atc-team-head:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:-2px;}
-.atc-team-lead{min-width:0;font-size:13px;line-height:18px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.atc-team-project{min-width:0;max-width:260px;font-size:15px;line-height:20px;font-weight:600;color:var(--dsw-alias-label-primary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.atc-team-project-none{color:var(--dsw-alias-label-secondary);}
+.atc-team-lead{min-width:0;font-size:12px;line-height:16px;color:var(--dsw-alias-label-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 .atc-team-role{font-size:10px;line-height:14px;letter-spacing:0.05em;text-transform:uppercase;color:var(--dsw-alias-label-secondary);}
+.atc-team-caption{font-size:11px;line-height:15px;color:var(--dsw-alias-label-secondary);font-variant-numeric:tabular-nums;white-space:nowrap;}
 .atc-headstat{font-size:11.5px;line-height:16px;color:var(--dsw-alias-label-secondary);font-variant-numeric:tabular-nums;white-space:nowrap;}
 .atc-headstat-inprogress{color:var(--dsw-alias-brand-primary);font-weight:500;}
-.atc-headstat-zero{color:var(--dsw-alias-label-secondary);font-weight:400;}
-.atc-headstat-blocked{color:var(--dsw-alias-state-warn-primary);}
-.atc-team-last{margin-left:auto;font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary);font-variant-numeric:tabular-nums;white-space:nowrap;}
 .atc-team-error{padding:5px 12px;border-top:1px solid var(--dsw-alias-border-l1);font-size:11.5px;line-height:16px;color:var(--dsw-alias-state-warn-primary);word-break:break-word;}
-.atc-team-body{display:flex;flex-direction:column;gap:10px;padding:2px 12px 12px;}
+.atc-team-body{display:flex;flex-direction:column;gap:8px;padding:2px 12px 12px;}
 .atc-caret{display:inline-block;width:6px;height:6px;border-right:1.5px solid currentColor;border-bottom:1.5px solid currentColor;transform:rotate(-45deg);transition:transform 120ms ease;flex:none;}
 .atc-caret-open{transform:rotate(45deg);}
-.atc-chip{display:inline-flex;align-items:center;max-width:220px;padding:1px 7px;border-radius:999px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary);font-size:11px;line-height:16px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
-.atc-chip-idle{color:var(--dsw-alias-label-secondary);}
-.atc-chip-owner{color:var(--dsw-alias-label-primary);}
-.atc-project-chip{max-width:180px;color:var(--dsw-alias-label-primary);}
-.atc-roster{display:flex;flex-wrap:wrap;align-items:center;gap:6px;min-width:0;}
-.atc-member{display:inline-flex;align-items:center;gap:6px;max-width:100%;min-width:0;padding:3px 9px 3px 4px;border:1px solid var(--dsw-alias-border-l1);border-radius:999px;background:var(--dsw-alias-bg-base);font-size:12px;line-height:16px;text-align:left;color:var(--dsw-alias-label-primary);}
-.atc-member-clickable{cursor:pointer;}
-.atc-member-clickable:hover{background:var(--dsw-alias-bg-layer-2);border-color:var(--dsw-alias-border-l2);}
-.atc-member-clickable:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px;}
-.atc-member-idle{opacity:0.66;}
-.atc-member-failed{border-color:color-mix(in srgb,var(--dsw-alias-state-error-primary) 40%,var(--dsw-alias-border-l1));}
-.atc-avatar{display:inline-flex;align-items:center;justify-content:center;flex:none;width:18px;height:18px;border-radius:50%;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary);font-size:10px;line-height:1;font-weight:600;text-transform:uppercase;}
-.atc-avatar-lead{background:color-mix(in srgb,var(--dsw-alias-brand-primary) 16%,var(--dsw-alias-bg-layer-1));color:var(--dsw-alias-brand-primary);}
-.atc-member-name{max-width:160px;font-size:12px;line-height:16px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-.atc-member-role{font-size:10px;line-height:12px;letter-spacing:0.05em;text-transform:uppercase;color:var(--dsw-alias-label-secondary);}
+.atc-donut{display:block;flex:none;}
+.atc-donut-track{stroke:var(--dsw-alias-border-l2);}
+.atc-donut-arc{stroke:var(--dsw-alias-state-success-primary);stroke-linecap:round;transition:stroke-dasharray 300ms ease;}
+.atc-stage{position:relative;min-width:0;}
+.atc-stage-svg{display:block;width:100%;height:auto;max-height:180px;overflow:visible;}
+.atc-stage-line{stroke:var(--dsw-alias-border-l1);stroke-width:1;}
+.atc-node{outline:none;}
+.atc-node-clickable{cursor:pointer;}
+.atc-node-track{stroke:var(--dsw-alias-border-l2);stroke-width:3;}
+.atc-node-arc{stroke:var(--dsw-alias-state-success-primary);stroke-width:3;stroke-linecap:round;transition:stroke-dasharray 300ms ease;}
+.atc-node-avatar{fill:var(--dsw-alias-bg-layer-2);stroke:var(--dsw-alias-border-l1);stroke-width:1.5;}
+.atc-node-avatar-lead{stroke:var(--dsw-alias-brand-primary);stroke-width:2.5;}
+.atc-node-initial{fill:var(--dsw-alias-label-primary);font-size:12px;font-weight:600;text-anchor:middle;dominant-baseline:central;}
+.atc-node-name{fill:var(--dsw-alias-label-primary);font-size:11.5px;text-anchor:middle;}
+.atc-node-stat{fill:var(--dsw-alias-label-secondary);font-size:10px;text-anchor:middle;font-variant-numeric:tabular-nums;}
+.atc-focus-ring{fill:none;stroke:var(--dsw-alias-brand-primary);stroke-width:1.5;opacity:0;pointer-events:none;}
+.atc-node:hover .atc-focus-ring{opacity:1;stroke:var(--dsw-alias-border-l2);}
+.atc-node:focus-visible .atc-focus-ring{opacity:1;stroke:var(--dsw-alias-brand-primary);}
+.atc-node-pulse{fill:none;stroke:var(--dsw-alias-state-success-primary);stroke-width:2;opacity:0;transform-box:fill-box;transform-origin:center;}
+.atc-node-running .atc-node-pulse{animation:atc-node-pulse 1.8s ease-out infinite;}
+.atc-node-orbit{transform-box:fill-box;transform-origin:center;}
+.atc-node-orbit-dot{fill:var(--dsw-alias-state-success-primary);}
+.atc-node-running .atc-node-orbit{animation:atc-orbit 2.6s linear infinite;}
+.atc-node-dash{fill:none;stroke:var(--dsw-alias-state-warn-primary);stroke-width:2;stroke-dasharray:4 5;opacity:0.9;transform-box:fill-box;transform-origin:center;}
+.atc-node-provisioning .atc-node-dash{animation:atc-orbit 6s linear infinite;}
+.atc-node-fail{fill:none;stroke:var(--dsw-alias-state-error-primary);stroke-width:2.5;}
+.atc-node-idle{opacity:0.65;}
+.atc-node-overflow .atc-node-avatar{stroke:var(--dsw-alias-border-l2);}
+.atc-detail{display:flex;flex-direction:column;gap:6px;padding:8px 10px;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;background:var(--dsw-alias-bg-base);}
+.atc-detail-head{display:flex;align-items:center;gap:6px;font-size:12px;line-height:16px;font-weight:600;}
+.atc-detail-name{color:var(--dsw-alias-label-primary);}
+.atc-detail-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:1px 14px;}
+.atc-detail-row{display:flex;align-items:baseline;justify-content:space-between;gap:8px;font-size:11px;line-height:16px;}
+.atc-detail-label{color:var(--dsw-alias-label-secondary);}
+.atc-detail-value{color:var(--dsw-alias-label-primary);font-variant-numeric:tabular-nums;}
 .atc-mstatus{display:inline-flex;align-items:center;gap:4px;font-size:11px;line-height:14px;color:var(--dsw-alias-label-secondary);}
 .atc-mdot{width:6px;height:6px;border-radius:50%;background:currentColor;flex:none;}
 .atc-mstatus-running{color:var(--dsw-alias-state-success-primary);}
 .atc-mstatus-provisioning{color:var(--dsw-alias-state-warn-primary);}
 .atc-mstatus-failed{color:var(--dsw-alias-state-error-primary);}
 .atc-mstatus-inactive{color:var(--dsw-alias-state-idle-primary);}
-.atc-member-more{color:var(--dsw-alias-label-secondary);}
-.atc-tasks{display:flex;flex-direction:column;gap:5px;min-width:0;}
-.atc-subhead{display:flex;align-items:center;gap:6px;margin:0;padding:0;font-size:12px;line-height:16px;font-weight:600;color:var(--dsw-alias-label-secondary);}
-.atc-subhead-inprogress{color:var(--dsw-alias-label-primary);}
-.atc-subhead-title{white-space:nowrap;}
-.atc-subhead-rule{flex:1;height:1px;min-width:8px;background:var(--dsw-alias-border-l1);}
-.atc-subhead-btn{width:100%;padding:2px 0;border:0;background:none;text-align:left;cursor:pointer;border-radius:6px;}
-.atc-subhead-btn:hover{color:var(--dsw-alias-label-primary);}
-.atc-subhead-btn:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px;}
-.atc-subhead-hint{font-size:11px;font-weight:400;color:var(--dsw-alias-label-secondary);white-space:nowrap;}
-.atc-count{display:inline-flex;align-items:center;justify-content:center;min-width:18px;padding:1px 6px;border-radius:999px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary);font-size:11px;line-height:16px;font-weight:500;font-variant-numeric:tabular-nums;}
-.atc-progress{display:flex;flex-direction:column;gap:6px;}
-.atc-icard{display:flex;flex-direction:column;gap:5px;min-width:0;padding:9px 11px;border:1px solid color-mix(in srgb,var(--dsw-alias-brand-primary) 26%,var(--dsw-alias-border-l1));border-left:2px solid var(--dsw-alias-brand-primary);border-radius:8px;background:color-mix(in srgb,var(--dsw-alias-brand-primary) 4%,var(--dsw-alias-bg-layer-1));}
-.atc-icard-top{display:flex;align-items:flex-start;gap:7px;min-width:0;}
-.atc-icard-top .atc-dot{margin-top:5px;}
-.atc-icard-subject{flex:1;min-width:0;margin:0;font-size:13px;line-height:18px;font-weight:600;word-break:break-word;}
-.atc-task-id{max-width:150px;font-size:10.5px;line-height:16px;color:var(--dsw-alias-label-secondary);font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
-.atc-meta{display:flex;flex-wrap:wrap;align-items:center;gap:5px;min-width:0;}
-.atc-icard-desc{display:-webkit-box;margin:0;font-size:12px;line-height:17px;color:var(--dsw-alias-label-secondary);-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-word;}
-.atc-icard-desc-open{display:block;overflow:visible;-webkit-line-clamp:unset;}
-.atc-expand{align-self:flex-start;padding:0;border:0;background:none;color:var(--dsw-alias-label-secondary);font-size:11px;line-height:16px;cursor:pointer;}
-.atc-expand:hover{color:var(--dsw-alias-label-primary);}
-.atc-expand:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px;border-radius:4px;}
-.atc-diagnostics{display:flex;flex-direction:column;gap:2px;}
-.atc-diagnostic{margin:0;font-size:11px;line-height:16px;color:var(--dsw-alias-state-error-primary);word-break:break-word;}
+.atc-tasks{display:flex;flex-direction:column;gap:4px;min-width:0;}
+.atc-task-summary{display:flex;align-items:center;gap:8px;width:100%;padding:0;border:0;border-radius:6px;background:none;text-align:left;cursor:pointer;font-size:12px;line-height:16px;}
+.atc-task-summary:hover{color:var(--dsw-alias-label-primary);}
+.atc-task-summary:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px;}
+.atc-task-summary-text{min-width:0;color:var(--dsw-alias-label-secondary);font-variant-numeric:tabular-nums;}
+.atc-task-toggle-hint{font-size:11px;color:var(--dsw-alias-label-secondary);white-space:nowrap;}
 .atc-rows{display:flex;flex-direction:column;margin:0;padding:0;}
 .atc-row{display:flex;align-items:center;gap:8px;min-width:0;padding:3px 2px;font-size:12px;line-height:18px;}
 .atc-row + .atc-row{border-top:1px solid var(--dsw-alias-border-l1);}
 .atc-row-dot{width:6px;height:6px;}
 .atc-row-subject{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 .atc-row-owner{flex:none;font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary);white-space:nowrap;}
-.atc-row-mark{flex:none;font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary);white-space:nowrap;}
-.atc-row-mark-warn{color:var(--dsw-alias-state-warn-primary);}
-.atc-rows-dim .atc-row{opacity:0.62;}
 .atc-empty-line{padding:2px;font-size:12px;line-height:17px;color:var(--dsw-alias-label-secondary);}
-.atc-activity{display:flex;flex-direction:column;gap:3px;min-width:0;}
-.atc-minihead{margin:0;font-size:11px;line-height:15px;font-weight:600;color:var(--dsw-alias-label-secondary);}
-.atc-act{display:flex;flex-direction:column;min-width:0;}
-.atc-act-row{display:flex;align-items:baseline;gap:8px;min-width:0;padding:1px 0;font-size:11.5px;line-height:16px;}
-.atc-act-time{flex:none;width:64px;text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--dsw-alias-label-secondary);}
-.atc-act-text{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-secondary);}
 .atc-skel{display:flex;flex-direction:column;gap:10px;animation:atc-breathe 1.6s ease-in-out infinite;}
 .atc-skel-strip{height:36px;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-layer-1);}
-.atc-skel-panel{height:132px;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-layer-1);}
-.atc-skel-panel-short{height:84px;}
+.atc-skel-stage{height:176px;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-layer-1);}
+.atc-skel-line{height:34px;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;background:var(--dsw-alias-bg-layer-1);}
 .atc-sr-only{position:absolute;width:1px;height:1px;margin:-1px;padding:0;border:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;}
 @keyframes atc-pulse{0%,100%{opacity:1;}50%{opacity:0.35;}}
 @keyframes atc-rotate{from{transform:rotate(0deg);}to{transform:rotate(360deg);}}
 @keyframes atc-breathe{0%,100%{opacity:1;}50%{opacity:0.55;}}
+@keyframes atc-orbit{from{transform:rotate(0deg);}to{transform:rotate(360deg);}}
+@keyframes atc-node-pulse{0%{transform:scale(1);opacity:0.55;}70%,100%{transform:scale(1.25);opacity:0;}}
 @media (max-width:899px){
 .atc-page{padding:14px 14px 32px;gap:12px;}
 .atc-header-side{width:100%;}
 .atc-select{max-width:100%;}
-.atc-team-last{margin-left:0;}
-.atc-act-time{width:56px;}
+.atc-team-project{max-width:100%;}
+.atc-detail-grid{grid-template-columns:repeat(auto-fill,minmax(130px,1fr));}
 }
 @media (prefers-reduced-motion:reduce){
-.atc-pulse,.atc-spin,.atc-skel{animation:none !important;}
-.atc-caret{transition:none !important;}
+.atc-pulse,.atc-spin,.atc-skel,.atc-node-pulse,.atc-node-orbit,.atc-node-dash,.atc-donut-arc,.atc-caret{animation:none !important;transition:none !important;}
+.atc-node-pulse,.atc-node-orbit{display:none;}
 }
 `
 
@@ -913,13 +1010,51 @@ window.__ModuleLoader__.load({
       return null
     }
 
-    const useIsomorphicLayoutEffect = typeof window !== 'undefined' ? React.useLayoutEffect : React.useEffect
-
     /* ------------------------------------------------------------------ */
     /* Small presentational components                                     */
     /* ------------------------------------------------------------------ */
 
+    function WorkDonut({ ratio }) {
+      const size = 34
+      const stroke = 4
+      const radius = (size - stroke) / 2 - 1
+      const circumference = 2 * Math.PI * radius
+      const pct = typeof ratio === 'number' && Number.isFinite(ratio) ? Math.min(1, Math.max(0, ratio)) : null
+      const arc = pct !== null && pct > 0
+        ? h('circle', {
+          className: 'atc-donut-arc',
+          cx: size / 2,
+          cy: size / 2,
+          r: radius,
+          fill: 'none',
+          strokeWidth: stroke,
+          strokeDasharray: `${(pct * circumference).toFixed(2)} ${circumference.toFixed(2)}`,
+          transform: `rotate(-90 ${size / 2} ${size / 2})`,
+        })
+        : null
+      return h('svg', {
+        className: 'atc-donut',
+        width: size,
+        height: size,
+        viewBox: `0 0 ${size} ${size}`,
+        'aria-hidden': 'true',
+        focusable: 'false',
+      },
+        h('circle', {
+          className: 'atc-donut-track',
+          cx: size / 2,
+          cy: size / 2,
+          r: radius,
+          fill: 'none',
+          strokeWidth: stroke,
+        }),
+        arc)
+    }
+
     function StatusStrip({ totals, t }) {
+      const tokensValue = totals.tokens !== null
+        ? t('team.tokens', { n: formatTokens(totals.tokens) })
+        : '—'
       const chips = [
         {
           key: 'inProgress',
@@ -934,6 +1069,13 @@ window.__ModuleLoader__.load({
           value: totals.running + '/' + totals.members,
           label: t('stat.runningMembers'),
           zero: totals.running === 0,
+        },
+        {
+          key: 'tokens',
+          className: 'atc-stat-tokens',
+          value: tokensValue,
+          label: t('stat.tokens'),
+          zero: totals.tokens === null || totals.tokens === 0,
         },
         {
           key: 'blocked',
@@ -997,8 +1139,8 @@ window.__ModuleLoader__.load({
     function Skeleton() {
       return h('div', { className: 'atc-skel', 'aria-hidden': 'true' },
         h('div', { className: 'atc-skel-strip' }),
-        h('div', { className: 'atc-skel-panel' }),
-        h('div', { className: 'atc-skel-panel atc-skel-panel-short' }))
+        h('div', { className: 'atc-skel-stage' }),
+        h('div', { className: 'atc-skel-line' }))
     }
 
     function ErrorCard({ t, message, onRetry }) {
@@ -1030,314 +1172,271 @@ window.__ModuleLoader__.load({
     }
 
     /* ------------------------------------------------------------------ */
-    /* Roster: compact active-first member chips                           */
+    /* Agent stage: one animated SVG node per member                       */
     /* ------------------------------------------------------------------ */
 
-    function MemberChip({ member, t, onOpen }) {
-      const safe = member && typeof member === 'object' ? member : {}
-      const id = asString(safe.id)
-      const name = asString(safe.name) || '—'
-      const role = asString(safe.role)
-      const status = asString(safe.status) || 'inactive'
+    function MemberDetail({ member, stats, t }) {
+      const name = asString(member && member.name) || '—'
+      const status = asString(member && member.status) || 'inactive'
       const tone = memberStatusTone(status)
       const statusLabel = memberStatusLabel(status, t)
-      const roleLabel = memberRoleLabel(role, t)
-      const initial = Array.from(name.trim())[0] || '?'
-      const model = asString(safe.model)
-      const provider = asString(safe.provider)
-      const lastActivityAt = asNumber(safe.lastActivityAt)
-      const titleParts = []
-      if (model) titleParts.push(model)
-      if (provider && provider !== model) titleParts.push(provider)
-      if (lastActivityAt !== null) titleParts.push(formatRelative(lastActivityAt, t))
-      const title = titleParts.length ? titleParts.join(' · ') : statusLabel
-      const clickable = typeof onOpen === 'function' && id !== ''
-      const tag = clickable ? 'button' : 'span'
-      const props = {
-        className: 'atc-member'
-          + (clickable ? ' atc-member-clickable' : '')
-          + (tone === 'inactive' ? ' atc-member-idle' : '')
-          + (tone === 'failed' ? ' atc-member-failed' : ''),
-        title,
+      const rows = [
+        { key: 'model', label: t('tooltip.model'), value: asString(member && member.model) || '—' },
+        { key: 'turns', label: t('tooltip.turns'), value: stats.turns !== null ? String(stats.turns) : '—' },
+        { key: 'steps', label: t('tooltip.steps'), value: stats.steps !== null ? String(stats.steps) : '—' },
+        { key: 'working', label: t('tooltip.working'), value: formatDuration(stats.workingMs, t) },
+        { key: 'idle', label: t('tooltip.idle'), value: formatDuration(stats.idleMs, t) },
+      ]
+      if (stats.tokens) {
+        rows.push({ key: 'total', label: t('tooltip.tokens'), value: formatTokens(stats.tokens.total) })
+        rows.push({ key: 'input', label: t('tooltip.input'), value: formatTokens(stats.tokens.uncachedInput) })
+        rows.push({ key: 'cacheRead', label: t('tooltip.cacheRead'), value: formatTokens(stats.tokens.cacheRead) })
+        rows.push({ key: 'cacheWrite', label: t('tooltip.cacheWrite'), value: formatTokens(stats.tokens.cacheWrite) })
+        rows.push({ key: 'output', label: t('tooltip.output'), value: formatTokens(stats.tokens.output) })
+      } else {
+        rows.push({ key: 'total', label: t('tooltip.tokens'), value: '—' })
       }
-      if (clickable) {
-        props.type = 'button'
-        props['aria-label'] = [name, roleLabel, statusLabel, t('member.open')].filter(Boolean).join(' · ')
-        props.onClick = () => onOpen(id)
-      }
-      return h(tag, props,
-        h('span', { className: 'atc-avatar' + (role === 'lead' ? ' atc-avatar-lead' : ''), 'aria-hidden': 'true' }, initial),
-        h('span', { className: 'atc-member-name' }, name),
-        h('span', { className: 'atc-member-role' }, roleLabel),
-        h('span', { className: 'atc-mstatus atc-mstatus-' + tone },
-          h('span', {
-            className: 'atc-mdot' + ((tone === 'running' || tone === 'provisioning') ? ' atc-pulse' : ''),
-            'aria-hidden': 'true',
-          }),
-          statusLabel))
+      return h('div', { className: 'atc-detail' },
+        h('div', { className: 'atc-detail-head' },
+          h('span', { className: 'atc-mstatus atc-mstatus-' + tone },
+            h('span', { className: 'atc-mdot', 'aria-hidden': 'true' }),
+            statusLabel),
+          h('span', { className: 'atc-detail-name' }, name)),
+        h('div', { className: 'atc-detail-grid' },
+          rows.map((row) => h('div', { key: row.key, className: 'atc-detail-row' },
+            h('span', { className: 'atc-detail-label' }, row.label),
+            h('span', { className: 'atc-detail-value' }, row.value)))))
     }
 
-    function Roster({ members, t, onOpen }) {
-      const list = asArray(members)
-      if (list.length === 0) return h('div', { className: 'atc-empty-line' }, t('roster.empty'))
-      const visible = list.slice(0, MEMBER_LIMIT)
-      const hidden = list.length - visible.length
-      return h('div', { className: 'atc-roster', role: 'group', 'aria-label': t('section.roster') },
-        visible.map((member, index) => h(MemberChip, {
-          key: asString(member && member.id) || 'member-' + index,
-          member,
-          t,
-          onOpen,
-        })),
-        hidden > 0 ? h('span', { className: 'atc-chip atc-member-more' }, t('roster.more', { n: hidden })) : null)
-    }
-
-    /* ------------------------------------------------------------------ */
-    /* Tasks: in-progress cards first, compact pending/completed rows      */
-    /* ------------------------------------------------------------------ */
-
-    /**
-     * A task is only "blocked" while it is still pending and the runtime reports
-     * it as not ready. `ready` is derived from completed blockers, and the
-     * runtime retains `blockedBy` after a blocker completes, so the dependency
-     * list alone is not a blocking signal. In-progress tasks always carry
-     * `ready === false` by contract, so they are claimed work, never blocked:
-     * only pending rows may render a blocked marker.
-     */
-    function pendingBlockedMarker(task, t) {
-      const safe = task && typeof task === 'object' ? task : {}
-      if (asString(safe.status) !== 'pending' || safe.ready !== false) return { text: '', blocked: false }
-      const blockedBy = asArray(safe.blockedBy).map(asString).filter(Boolean)
-      return {
-        text: blockedBy.length > 0 ? t('task.blockedBy', { ids: blockedBy.join(', ') }) : t('task.blocked'),
-        blocked: true,
+    function AgentStage({ members, t, onOpen }) {
+      const [activeId, setActiveId] = React.useState(null)
+      const ordered = stageMembers(members)
+      if (ordered.length === 0) return h('div', { className: 'atc-empty-line' }, t('roster.empty'))
+      const shown = ordered.slice(0, MEMBER_LIMIT)
+      const overflow = ordered.length - shown.length
+      const memberStatsList = shown.map((member) => memberStatsFor(member))
+      // Scale nodes against the whole team's max token total, not only the
+      // visible window (the frozen spec's log-scale rule).
+      let maxTokens = 0
+      for (const member of ordered) {
+        const stats = memberStatsFor(member)
+        if (stats.tokens && stats.tokens.total > maxTokens) maxTokens = stats.tokens.total
       }
-    }
-
-    function InProgressCard({ task, t }) {
-      const [expanded, setExpanded] = React.useState(false)
-      const [clamped, setClamped] = React.useState(false)
-      const textRef = React.useRef(null)
-      const safe = task && typeof task === 'object' ? task : {}
-      const description = asString(safe.description)
-      const subject = asString(safe.subject) || asString(safe.id) || '—'
-      const taskId = asString(safe.id)
-      const ownerName = asString(safe.ownerName)
-      const writeScopes = asArray(safe.writeScopes).map(asString).filter(Boolean)
-      const writeWarnings = asArray(safe.writeScopeWarnings).map(asString).filter(Boolean)
-
-      useIsomorphicLayoutEffect(() => {
-        if (expanded || !description) {
-          setClamped(false)
-          return undefined
+      const total = shown.length + (overflow > 0 ? 1 : 0)
+      const width = Math.max(STAGE_MIN_WIDTH, 64 + Math.max(0, total - 1) * NODE_GAP)
+      const step = NODE_GAP
+      const startX = width / 2 - (Math.max(0, total - 1) * step) / 2
+      const hasLead = asString(shown[0] && shown[0].role) === 'lead'
+      const activeMember = activeId
+        ? shown.find((member) => asString(member && member.id) === activeId) || null
+        : null
+      const elements = []
+      if (total > 0) {
+        elements.push(h('line', {
+          key: 'connector',
+          className: 'atc-stage-line',
+          x1: startX,
+          y1: STAGE_CENTER_Y,
+          x2: startX + Math.max(0, total - 1) * step,
+          y2: STAGE_CENTER_Y,
+        }))
+      }
+      for (let index = 0; index < shown.length; index += 1) {
+        const member = shown[index]
+        const stats = memberStatsList[index]
+        const id = asString(member && member.id)
+        const name = asString(member && member.name) || t('team.unnamed')
+        const status = asString(member && member.status) || 'inactive'
+        const tone = memberStatusTone(status)
+        const nodeTone = tone === 'inactive' ? 'idle' : tone
+        const isLead = index === 0 && hasLead
+        const radius = nodeRadius(stats.tokens ? stats.tokens.total : null, maxTokens, isLead)
+        const centerX = startX + index * step
+        const statusLabel = memberStatusLabel(status, t)
+        const nodeAria = t('team.nodeAria', {
+          name,
+          status: statusLabel,
+          turns: stats.turns !== null ? String(stats.turns) : '—',
+          tokens: stats.tokens ? formatTokens(stats.tokens.total) : '—',
+        })
+        const clickable = typeof onOpen === 'function' && id !== ''
+        const showDetail = () => setActiveId(id || null)
+        const hideDetail = () => setActiveId((current) => (current === id ? null : current))
+        const activate = () => {
+          if (clickable) onOpen(id)
         }
-        const node = textRef.current
-        if (!node) return undefined
-        const measure = () => {
-          try {
-            setClamped(node.scrollHeight > node.clientHeight + 1)
-          } catch (error) {
-            /* measurement is cosmetic */
-          }
+        const nodeProps = {
+          key: id || 'member-' + index,
+          className: 'atc-node atc-node-' + nodeTone
+            + (isLead ? ' atc-node-lead' : '')
+            + (clickable ? ' atc-node-clickable' : ''),
+          transform: `translate(${centerX} ${STAGE_CENTER_Y})`,
+          tabIndex: 0,
+          role: clickable ? 'button' : 'group',
+          'aria-label': nodeAria,
+          onMouseEnter: showDetail,
+          onMouseLeave: hideDetail,
+          onFocus: showDetail,
+          onBlur: hideDetail,
         }
-        measure()
-        if (typeof ResizeObserver === 'undefined') return undefined
-        let observer = null
-        try {
-          observer = new ResizeObserver(measure)
-          observer.observe(node)
-        } catch (error) {
-          observer = null
-        }
-        return () => {
-          if (observer) {
-            try {
-              observer.disconnect()
-            } catch (error) {
-              /* ignore */
+        if (clickable) {
+          nodeProps.onClick = activate
+          nodeProps.onKeyDown = (event) => {
+            if (event.key === 'Enter' || event.key === ' ' || event.key === 'Spacebar') {
+              event.preventDefault()
+              activate()
             }
           }
         }
-      }, [description, expanded])
-
-      return h('article', { className: 'atc-icard' },
-        h('div', { className: 'atc-icard-top' },
-          h('span', { className: 'atc-dot atc-dot-brand', title: t('status.in_progress'), 'aria-hidden': 'true' }),
-          h('h4', { className: 'atc-icard-subject' }, subject),
-          taskId ? h('span', { className: 'atc-task-id', title: taskId }, taskId) : null),
-        h('div', { className: 'atc-meta' },
-          h('span', { className: 'atc-chip atc-chip-owner', title: t('task.owner', { name: ownerName || t('task.unowned') }) },
-            '@' + (ownerName || t('task.unowned'))),
-          writeScopes.map((scope, index) => h('span', {
-            className: 'atc-chip',
-            key: 'scope-' + index,
-            title: t('task.scopesLabel') + ': ' + scope,
-          }, scope))),
-        writeWarnings.length
-          ? h('div', { className: 'atc-diagnostics' },
-            writeWarnings.map((warning, index) => h('p', { className: 'atc-diagnostic', key: 'warning-' + index }, warning)))
-          : null,
-        description
-          ? h('p', { ref: textRef, className: 'atc-icard-desc' + (expanded ? ' atc-icard-desc-open' : '') }, description)
-          : null,
-        description && (clamped || expanded)
-          ? h('button', {
-            type: 'button',
-            className: 'atc-expand',
-            'aria-expanded': expanded,
-            onClick: () => setExpanded((value) => !value),
-          }, t(expanded ? 'task.collapse' : 'task.expand'))
-          : null)
+        const art = [
+          h('circle', { key: 'track', className: 'atc-node-track', r: radius + 5, fill: 'none' }),
+        ]
+        if (stats.workingRatio !== null && stats.workingRatio > 0) {
+          art.push(h('circle', {
+            key: 'arc',
+            className: 'atc-node-arc',
+            r: radius + 5,
+            fill: 'none',
+            pathLength: 100,
+            strokeDasharray: `${(Math.min(1, stats.workingRatio) * 100).toFixed(2)} 100`,
+            transform: 'rotate(-90)',
+          }))
+        }
+        if (tone === 'running') {
+          art.push(h('circle', { key: 'pulse', className: 'atc-node-pulse', r: radius + 5, fill: 'none' }))
+          art.push(h('g', { key: 'orbit', className: 'atc-node-orbit' },
+            h('circle', { className: 'atc-node-orbit-keep', r: radius + 5, fill: 'none', stroke: 'none' }),
+            h('circle', { className: 'atc-node-orbit-dot', cx: 0, cy: -(radius + 5), r: 2.5 })))
+        } else if (tone === 'provisioning') {
+          art.push(h('circle', { key: 'dash', className: 'atc-node-dash', r: radius + 5, fill: 'none' }))
+        } else if (tone === 'failed') {
+          art.push(h('circle', { key: 'fail', className: 'atc-node-fail', r: radius + 5, fill: 'none' }))
+        }
+        art.push(h('circle', { key: 'focus', className: 'atc-focus-ring', r: radius + 10, fill: 'none' }))
+        art.push(h('circle', {
+          key: 'avatar',
+          className: 'atc-node-avatar' + (isLead ? ' atc-node-avatar-lead' : ''),
+          r: radius,
+        }))
+        art.push(h('text', { key: 'initial', className: 'atc-node-initial', y: 0.5 }, initialOf(name)))
+        elements.push(h('g', nodeProps, art))
+        elements.push(h('text', {
+          key: 'name-' + index,
+          className: 'atc-node-name',
+          x: centerX,
+          y: STAGE_NAME_Y,
+        }, truncateText(name, 12)))
+        elements.push(h('text', {
+          key: 'stat-' + index,
+          className: 'atc-node-stat',
+          x: centerX,
+          y: STAGE_STAT_Y,
+        }, memberStatLine(stats, t)))
+      }
+      if (overflow > 0) {
+        const centerX = startX + shown.length * step
+        const overflowLabel = t('team.moreMembers', { n: overflow })
+        elements.push(h('g', {
+          key: 'overflow',
+          className: 'atc-node atc-node-overflow',
+          transform: `translate(${centerX} ${STAGE_CENTER_Y})`,
+          role: 'img',
+          'aria-label': overflowLabel,
+        },
+          h('circle', { className: 'atc-node-track', r: RADIUS_MIN + 5, fill: 'none' }),
+          h('circle', { className: 'atc-node-avatar', r: RADIUS_MIN }),
+          h('text', { className: 'atc-node-initial', y: 0.5 }, '+' + overflow)))
+      }
+      return h('div', { className: 'atc-stage' },
+        h('svg', {
+          className: 'atc-stage-svg',
+          viewBox: `0 0 ${width} ${STAGE_HEIGHT}`,
+          role: 'group',
+          'aria-label': t('team.stageLabel', { n: ordered.length }),
+        }, elements),
+        activeMember ? h(MemberDetail, { key: 'detail', member: activeMember, stats: memberStatsFor(activeMember), t }) : null)
     }
 
-    function PendingRow({ task, t }) {
+    /* ------------------------------------------------------------------ */
+    /* Tasks: one compact summary line + in-progress rows on demand        */
+    /* ------------------------------------------------------------------ */
+
+    function TaskRow({ task, t }) {
       const safe = task && typeof task === 'object' ? task : {}
       const subject = asString(safe.subject) || asString(safe.id) || '—'
       const ownerName = asString(safe.ownerName)
       const description = asString(safe.description)
-      const blocked = pendingBlockedMarker(safe, t)
-      // A ready pending task wins over a retained blockedBy list (completed blockers).
-      const marker = blocked.blocked ? blocked.text : (safe.ready === true ? t('task.ready') : '')
-      const markerWarn = blocked.blocked
       return h('div', { className: 'atc-row', role: 'listitem', title: description || undefined },
         h('span', {
-          className: 'atc-dot atc-row-dot' + (markerWarn ? ' atc-dot-warn' : ''),
-          title: t('status.pending'),
+          className: 'atc-dot atc-dot-brand atc-row-dot',
+          title: t('status.in_progress'),
           'aria-hidden': 'true',
         }),
         h('span', { className: 'atc-row-subject' }, subject),
-        h('span', { className: 'atc-row-owner' }, ownerName ? '@' + ownerName : t('task.unowned')),
-        marker ? h('span', { className: 'atc-row-mark' + (markerWarn ? ' atc-row-mark-warn' : '') }, marker) : null)
+        h('span', {
+          className: 'atc-row-owner',
+          title: t('task.owner', { name: ownerName || t('task.unowned') }),
+        }, ownerName ? '@' + ownerName : t('task.unowned')))
     }
 
-    function CompletedRow({ task, t }) {
-      const safe = task && typeof task === 'object' ? task : {}
-      const subject = asString(safe.subject) || asString(safe.id) || '—'
-      const ownerName = asString(safe.ownerName)
-      return h('div', { className: 'atc-row', role: 'listitem' },
-        h('span', { className: 'atc-dot atc-dot-success', title: t('status.completed'), 'aria-hidden': 'true' }),
-        h('span', { className: 'atc-row-subject' }, subject),
-        h('span', { className: 'atc-row-owner' }, ownerName ? '@' + ownerName : t('task.unowned')))
-    }
-
-    function TasksSection({ team, t, completedOpen, onToggleCompleted }) {
-      const tasks = asArray(team && team.tasks)
-      const inProgress = tasks.filter((task) => asString(task && task.status) === 'in_progress')
-      const pending = tasks.filter((task) => asString(task && task.status) === 'pending')
-      const completed = tasks.filter((task) => asString(task && task.status) === 'completed')
-      const blocks = []
-      blocks.push(h('section', { key: 'inprogress', className: 'atc-tasks', 'aria-label': t('section.inProgress') },
-        h('h3', { className: 'atc-subhead atc-subhead-inprogress' },
-          h('span', { className: 'atc-subhead-title' }, t('section.inProgress')),
-          h('span', { className: 'atc-count' }, String(inProgress.length)),
-          h('span', { className: 'atc-subhead-rule', 'aria-hidden': 'true' })),
-        inProgress.length
-          ? h('div', { className: 'atc-progress' }, inProgress.map((task, index) => h(InProgressCard, {
-            key: asString(task && task.id) || 'task-' + index,
-            task,
-            t,
-          })))
-          : h('div', { className: 'atc-empty-line' }, tasks.length === 0 ? t('tasks.empty') : t('tasks.noInProgress'))))
-      if (pending.length > 0) {
-        blocks.push(h('section', { key: 'pending', className: 'atc-tasks', 'aria-label': t('section.pending') },
-          h('h3', { className: 'atc-subhead' },
-            h('span', { className: 'atc-subhead-title' }, t('section.pending')),
-            h('span', { className: 'atc-count' }, String(pending.length)),
-            h('span', { className: 'atc-subhead-rule', 'aria-hidden': 'true' })),
-          h('div', { className: 'atc-rows', role: 'list' }, pending.map((task, index) => h(PendingRow, {
-            key: asString(task && task.id) || 'task-pending-' + index,
-            task,
-            t,
-          })))))
-      }
-      if (completed.length > 0) {
-        blocks.push(h('div', { key: 'completed', className: 'atc-tasks' },
-          h('button', {
-            type: 'button',
-            className: 'atc-subhead atc-subhead-btn',
-            'aria-expanded': completedOpen,
-            'aria-label': t('tasks.completedToggle'),
-            onClick: onToggleCompleted,
-          },
-            h('span', { className: 'atc-caret' + (completedOpen ? ' atc-caret-open' : ''), 'aria-hidden': 'true' }),
-            h('span', { className: 'atc-subhead-title' }, t('tasks.completedCount', { n: completed.length })),
-            h('span', { className: 'atc-subhead-rule', 'aria-hidden': 'true' }),
-            h('span', { className: 'atc-subhead-hint' }, t(completedOpen ? 'team.collapse' : 'team.expand'))),
-          completedOpen
-            ? h('div', {
-              className: 'atc-rows atc-rows-dim',
-              role: 'list',
-              'aria-label': t('section.completed'),
-            }, completed.map((task, index) => h(CompletedRow, {
-              key: asString(task && task.id) || 'task-completed-' + index,
-              task,
-              t,
-            })))
-            : null))
-      }
-      return h(React.Fragment, null, blocks)
+    function TasksSummary({ team, counts, t, expanded, onToggle }) {
+      const inProgress = asArray(team && team.tasks).filter((task) => asString(task && task.status) === 'in_progress')
+      const summary = t('tasks.summary', {
+        inProgress: t('tasks.inProgress', { n: counts.inProgress }),
+        pending: t('tasks.pending', { n: counts.pending }),
+        blocked: t('tasks.blocked', { n: counts.blocked }),
+      })
+      return h('div', { className: 'atc-tasks' },
+        h('button', {
+          type: 'button',
+          className: 'atc-task-summary',
+          'aria-expanded': expanded,
+          'aria-label': t('tasks.toggle'),
+          onClick: onToggle,
+        },
+          h('span', { className: 'atc-caret' + (expanded ? ' atc-caret-open' : ''), 'aria-hidden': 'true' }),
+          h('span', { className: 'atc-task-summary-text' }, summary),
+          h('span', { className: 'atc-task-toggle-hint' }, t(expanded ? 'team.collapse' : 'team.expand'))),
+        expanded
+          ? (inProgress.length > 0
+            ? h('div', { className: 'atc-rows', role: 'list', 'aria-label': t('section.inProgress') },
+              inProgress.map((task, index) => h(TaskRow, {
+                key: asString(task && task.id) || 'task-' + index,
+                task,
+                t,
+              })))
+            : h('div', { className: 'atc-empty-line' }, t('tasks.noInProgress')))
+          : null)
     }
 
     /* ------------------------------------------------------------------ */
-    /* Activity: compact list, latest entries first                        */
+    /* Team section: workspace-first header + stage + task summary         */
     /* ------------------------------------------------------------------ */
 
-    function ActivityRow({ item, t }) {
-      const kind = asString(item && item.kind)
-      const fallbackText = asString(item && item.text)
-      const taskId = asString(item && item.taskId)
-      const memberName = asString(item && item.memberName)
-      const subject = asString(item && item.subject)
-      const actionText = actionLabel(item && item.action, t)
-      const parts = []
-      if (taskId) parts.push(taskId)
-      if (actionText) parts.push(actionText)
-      if (memberName) parts.push(memberName)
-      const composed = (kind === 'task' || kind === 'member') && parts.length > 0
-      const main = composed ? parts.join(' · ') : (fallbackText || actionText || subject || t('activity.unknown'))
-      const secondary = subject && subject !== main ? subject : ''
-      const absolute = asNumber(item && item.time) !== null ? formatShortDate(item && item.time) : ''
-      const rowTitle = [secondary, absolute].filter(Boolean).join(' · ')
-      return h('div', { className: 'atc-act-row', title: rowTitle || undefined },
-        h('span', { className: 'atc-act-time', title: absolute || undefined }, formatRelative(item && item.time, t)),
-        h('span', { className: 'atc-act-text', title: secondary || undefined }, main))
-    }
-
-    function ActivityList({ team, t }) {
-      const items = asArray(team && team.activity).slice(0, ACTIVITY_LIMIT)
-      return h('section', { className: 'atc-activity', 'aria-label': t('section.activity') },
-        h('h3', { className: 'atc-minihead' }, t('section.activity')),
-        items.length
-          ? h('div', { className: 'atc-act' }, items.map((item, index) => h(ActivityRow, {
-            key: (asString(item && item.seq) || 'activity') + '-' + index,
-            item,
-            t,
-          })))
-          : h('div', { className: 'atc-empty-line' }, t('activity.empty')))
-    }
-
-    /* ------------------------------------------------------------------ */
-    /* Team section: collapsible header + body                             */
-    /* ------------------------------------------------------------------ */
-
-    function TeamSection({ team, index, expanded, completedOpen, onToggle, onToggleCompleted, onOpen, t }) {
+    function TeamSection({ team, index, expanded, tasksExpanded, onToggle, onToggleTasks, onOpen, t }) {
       const safe = team && typeof team === 'object' ? team : {}
       const counts = teamCounts(safe)
       const active = teamActiveFromCounts(safe, counts)
       const project = teamProject(safe)
-      const projectTitle = project ? projectLabel(project, t) : ''
-      const members = sortMembers(asArray(safe.members))
-      const lead = asArray(safe.members).find((member) => asString(member && member.role) === 'lead') || members[0] || null
+      const projectTitle = project ? projectLabel(project, t) : t('project.none')
+      const members = stageMembers(asArray(safe.members))
+      const lead = members[0] || null
       const leadName = lead ? (asString(lead.name) || t('team.unnamed')) : t('team.unnamed')
       const leadRole = lead ? memberRoleLabel(lead.role, t) : ''
-      const lastActivity = formatRelative(teamLatestTime(safe), t)
+      const stats = teamStatsFor(safe)
+      const turnsText = stats.turns !== null ? t('team.turns', { n: stats.turns }) : '—'
+      const tokensText = stats.tokens ? t('team.tokens', { n: formatTokens(stats.tokens.total) }) : '—'
+      const caption = t('team.workIdle', {
+        work: t('team.work') + ' ' + formatDuration(stats.workingMs, t),
+        idle: t('team.idle') + ' ' + formatDuration(stats.idleMs, t),
+      })
       const errorMessage = asString(safe.error)
       const memberBusy = counts.running + counts.provisioning > 0
       let dotClass = 'atc-dot-idle'
       if (memberBusy) dotClass = 'atc-dot-success atc-pulse'
       else if (counts.inProgress > 0) dotClass = 'atc-dot-brand'
       const bodyId = 'atc-team-body-' + index
-      const headingText = projectTitle ? projectTitle + ' · ' + leadName : leadName
+      const headingText = projectTitle + ' · ' + leadName
       return h('section', { className: 'atc-team' + (active ? ' atc-team-active' : '') },
         h('h2', { className: 'atc-sr-only' }, headingText),
         h('button', {
@@ -1348,28 +1447,27 @@ window.__ModuleLoader__.load({
           title: expanded ? t('team.collapse') : t('team.expand'),
           onClick: onToggle,
         },
-          h('span', { className: 'atc-dot ' + dotClass, 'aria-hidden': 'true' }),
-          projectTitle ? h('span', {
-            className: 'atc-chip atc-project-chip',
-            title: project && project.path ? project.path : projectTitle,
-          }, projectTitle) : null,
+          h('span', {
+            className: 'atc-team-project' + (project ? '' : ' atc-team-project-none'),
+            title: project && project.path ? project.path : undefined,
+          }, projectTitle),
           h('span', { className: 'atc-team-lead' }, leadName),
           leadRole ? h('span', { className: 'atc-team-role' }, leadRole) : null,
-          active ? null : h('span', { className: 'atc-chip atc-chip-idle' }, t('team.idle')),
-          h('span', {
-            className: 'atc-headstat atc-headstat-inprogress' + (counts.inProgress === 0 ? ' atc-headstat-zero' : ''),
-          }, t('team.inProgress', { n: counts.inProgress })),
-          h('span', { className: 'atc-headstat' }, t('team.members', { n: counts.members })),
-          counts.blocked > 0 ? h('span', { className: 'atc-headstat atc-headstat-blocked' }, t('team.blocked', { n: counts.blocked })) : null,
-          h('span', { className: 'atc-team-last' }, lastActivity),
+          h('span', { className: 'atc-dot ' + dotClass, 'aria-hidden': 'true' }),
+          h(WorkDonut, { ratio: stats.workingRatio }),
+          h('span', { className: 'atc-team-caption' }, caption),
+          h('span', { className: 'atc-headstat' }, turnsText),
+          h('span', { className: 'atc-headstat' }, tokensText),
+          counts.inProgress > 0
+            ? h('span', { className: 'atc-headstat atc-headstat-inprogress' }, t('team.inProgress', { n: counts.inProgress }))
+            : null,
           h('span', { className: 'atc-caret' + (expanded ? ' atc-caret-open' : ''), 'aria-hidden': 'true' }),
           h('span', { className: 'atc-sr-only' }, t(expanded ? 'team.collapse' : 'team.expand'))),
         errorMessage ? h('div', { className: 'atc-team-error', role: 'alert' }, t('team.error', { message: errorMessage })) : null,
         expanded
           ? h('div', { className: 'atc-team-body', id: bodyId },
-            h(Roster, { members, t, onOpen }),
-            h(TasksSection, { team: safe, t, completedOpen, onToggleCompleted }),
-            h(ActivityList, { team: safe, t }))
+            h(AgentStage, { members, t, onOpen }),
+            h(TasksSummary, { team: safe, counts, t, expanded: tasksExpanded, onToggle: onToggleTasks }))
           : null)
     }
 
@@ -1389,7 +1487,7 @@ window.__ModuleLoader__.load({
 
       const [projectState, setProjectState] = React.useState('all')
       const [expandedTeams, setExpandedTeams] = React.useState({})
-      const [completedTeams, setCompletedTeams] = React.useState({})
+      const [expandedTasks, setExpandedTasks] = React.useState({})
       const projectId = effectiveProjectId(projectState, projects)
       const filtered = filterTeams(teams, projectId)
       const totals = aggregateTeams(filtered)
@@ -1407,8 +1505,8 @@ window.__ModuleLoader__.load({
           return { ...previous, [teamKey]: !current }
         })
       }
-      const toggleCompleted = (teamKey) => {
-        setCompletedTeams((previous) => ({ ...previous, [teamKey]: !previous[teamKey] }))
+      const toggleTasks = (teamKey) => {
+        setExpandedTasks((previous) => ({ ...previous, [teamKey]: !previous[teamKey] }))
       }
 
       const body = []
@@ -1435,15 +1533,15 @@ window.__ModuleLoader__.load({
             const team = filtered[index]
             const teamKey = asString(team && team.id) || 'team-' + index
             const expanded = hasOwn(expandedTeams, teamKey) ? expandedTeams[teamKey] === true : teamActive(team)
-            const completedOpen = hasOwn(completedTeams, teamKey) ? completedTeams[teamKey] === true : false
+            const tasksExpanded = hasOwn(expandedTasks, teamKey) ? expandedTasks[teamKey] === true : false
             sections.push(h(TeamSection, {
               key: teamKey,
               team,
               index,
               expanded,
-              completedOpen,
+              tasksExpanded,
               onToggle: () => toggleTeam(teamKey, teamActive(team)),
-              onToggleCompleted: () => toggleCompleted(teamKey),
+              onToggleTasks: () => toggleTasks(teamKey),
               onOpen: memberOpener,
               t,
             }))

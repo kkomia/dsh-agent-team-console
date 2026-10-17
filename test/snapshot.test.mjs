@@ -29,6 +29,32 @@ const TEAMMATE_ID = 'session-reviewer'
 /** Fake Lead-session creation cwd; with no workspace registry this is the project fallback. */
 const ROOT_CWD = 'C:\\Users\\dev\\team'
 const DEFAULT_CONFIG = { provider: 'deepseek', model: 'deepseek-flash' }
+/** Pinned snapshot clock for deterministic wallMs/stats assertions. */
+const FIXED_NOW = 1_700_000_000_000
+/** Expected all-null rows when the session projections are unavailable. */
+const NULL_MEMBER_STATS = {
+  turns: null,
+  steps: null,
+  tokens: null,
+  llmMs: null,
+  toolMs: null,
+  workingMs: null,
+  idleMs: null,
+  wallMs: null,
+  workingRatio: null,
+  live: false,
+}
+const NULL_TEAM_STATS = {
+  turns: null,
+  steps: null,
+  tokens: null,
+  llmMs: null,
+  toolMs: null,
+  workingMs: null,
+  idleMs: null,
+  wallMs: null,
+  workingRatio: null,
+}
 
 // ---------------------------------------------------------------------------
 // fakes
@@ -99,6 +125,20 @@ function createFakeWorkspaceRegistry(workspaces) {
   }
 }
 
+/**
+ * Fake `sessionProjections` service: `stateOf(session, key)` reads one
+ * per-session state map shaped `{ [sessionId]: { sessionStats?, tokenUsage? } }`.
+ */
+function createFakeSessionProjections(statesBySessionId) {
+  return {
+    stateOf(session, key) {
+      if (!session || typeof session.id !== 'string') return undefined
+      const states = statesBySessionId[session.id]
+      return states ? states[key] : undefined
+    },
+  }
+}
+
 function teamEvent(seq, time, member) {
   return { type: 'team/member', seq, time, data: { version: 2, teamId: ROOT_ID, member } }
 }
@@ -130,8 +170,10 @@ function taskView({ id, status = 'pending', ready = false, blockedBy = [], subje
  * @param options.withSessions - mount the `sessions` service (default true).
  * @param options.cwd - Lead session creation cwd; null/empty omits `header.cwd`.
  * @param options.workspaces - when an array, mounts a fake `workspaceRegistry`.
+ * @param options.createdAt - creation-header `createdAt`; undefined omits it.
+ * @param options.projections - session-id -> projection states fake mount.
  */
-function buildTeamServices({ withSessions = true, cwd = ROOT_CWD, workspaces = null } = {}) {
+function buildTeamServices({ withSessions = true, cwd = ROOT_CWD, workspaces = null, createdAt, projections = null } = {}) {
   const rootAgent = { id: ROOT_ID, status: 'running' }
   const teammateAgent = { id: TEAMMATE_ID, status: 'running' }
 
@@ -183,11 +225,15 @@ function buildTeamServices({ withSessions = true, cwd = ROOT_CWD, workspaces = n
     { type: 'tool/result', seq: 4, time: 1180, data: {} },
   ]
 
-  const leadCreationHeader = typeof cwd === 'string' && cwd.length > 0 ? { cwd } : undefined
+  const leadCreationHeader = {}
+  if (typeof cwd === 'string' && cwd.length > 0) leadCreationHeader.cwd = cwd
+  if (createdAt !== undefined) leadCreationHeader.createdAt = createdAt
+  const leadHeader = Object.keys(leadCreationHeader).length > 0 ? leadCreationHeader : undefined
+  const memberCreationHeader = createdAt !== undefined ? { createdAt } : undefined
   const sessions = {
     get(id) {
-      if (id === ROOT_ID) return makeSession(ROOT_ID, rootEvents, { config: { provider: 'deepseek', model: 'deepseek-flash' } }, leadCreationHeader)
-      if (id === TEAMMATE_ID) return makeSession(TEAMMATE_ID, reviewerEvents, { config: { provider: 'deepseek', model: 'deepseek-chat' } })
+      if (id === ROOT_ID) return makeSession(ROOT_ID, rootEvents, { config: { provider: 'deepseek', model: 'deepseek-flash' } }, leadHeader)
+      if (id === TEAMMATE_ID) return makeSession(TEAMMATE_ID, reviewerEvents, { config: { provider: 'deepseek', model: 'deepseek-chat' } }, memberCreationHeader)
       return undefined
     },
   }
@@ -268,17 +314,20 @@ function buildTeamServices({ withSessions = true, cwd = ROOT_CWD, workspaces = n
   const services = { agents, agentTeams }
   if (withSessions) services.sessions = sessions
   if (Array.isArray(workspaces)) services.workspaceRegistry = createFakeWorkspaceRegistry(workspaces)
+  if (projections !== null) services.sessionProjections = createFakeSessionProjections(projections)
   return { services, rootEvents, sessions, members, tasks }
 }
 
 /**
- * Smaller team fixture for the focused v2 tests: Lead + teammate(s) + tasks,
- * one task event to anchor `activityAt`, optional creation-header cwd and fake
- * workspace registry. Reuses the same session/workspace fakes as above.
+ * Smaller team fixture for the focused v2/v3 tests: Lead + teammate(s) + tasks,
+ * one task event to anchor `activityAt`, optional creation header (cwd +
+ * createdAt), fake workspace registry and fake session projections. Reuses the
+ * same session/workspace fakes as above.
  */
 function buildSimpleTeam({
   teamId = ROOT_ID,
   cwd = ROOT_CWD,
+  createdAt,
   rootStatus = 'running',
   memberStatus = 'running',
   members,
@@ -286,6 +335,7 @@ function buildSimpleTeam({
   latestTime = 1000,
   workspaces = null,
   withSessions = true,
+  projections = null,
 } = {}) {
   const rootAgent = { id: teamId, status: rootStatus }
   const teammateViews =
@@ -305,7 +355,11 @@ function buildSimpleTeam({
       },
     },
   ]
-  const creationHeader = typeof cwd === 'string' && cwd.length > 0 ? { cwd } : undefined
+  const creationHeader = {}
+  if (typeof cwd === 'string' && cwd.length > 0) creationHeader.cwd = cwd
+  if (createdAt !== undefined) creationHeader.createdAt = createdAt
+  const header = Object.keys(creationHeader).length > 0 ? creationHeader : undefined
+  const memberIds = new Set(memberViews.map((member) => member.id))
   const services = {
     agents: { list: () => [rootAgent] },
     agentTeams: {
@@ -326,11 +380,14 @@ function buildSimpleTeam({
   if (withSessions) {
     services.sessions = {
       get(id) {
-        return id === teamId ? makeSession(teamId, rootEvents, { config: DEFAULT_CONFIG }, creationHeader) : undefined
+        if (id === teamId) return makeSession(teamId, rootEvents, { config: DEFAULT_CONFIG }, header)
+        if (memberIds.has(id)) return makeSession(id, [], { config: DEFAULT_CONFIG }, header)
+        return undefined
       },
     }
   }
   if (Array.isArray(workspaces)) services.workspaceRegistry = createFakeWorkspaceRegistry(workspaces)
+  if (projections !== null) services.sessionProjections = createFakeSessionProjections(projections)
   return { services, rootAgent, teamId, memberViews, tasks }
 }
 
@@ -377,6 +434,18 @@ function combineTeamServices(...fixtures) {
       },
     }
   }
+  const projectionOwners = fixtures.filter((fixture) => fixture.services.sessionProjections)
+  if (projectionOwners.length > 0) {
+    services.sessionProjections = {
+      stateOf(session, key) {
+        for (const fixture of projectionOwners) {
+          const state = fixture.services.sessionProjections.stateOf(session, key)
+          if (state !== undefined) return state
+        }
+        return undefined
+      },
+    }
+  }
   return services
 }
 
@@ -394,7 +463,7 @@ function assertLossless(value) {
 
 test('module exports inject=[webServer] and pure helpers', () => {
   assert.deepEqual(inject, ['webServer'])
-  assert.equal(VERSION, 2)
+  assert.equal(VERSION, 3)
   assert.equal(typeof apply, 'function')
   assert.equal(typeof collectTeams, 'function')
   assert.equal(typeof createSnapshot, 'function')
@@ -418,7 +487,7 @@ const EMPTY_TOTALS = { teams: 0, activeTeams: 0, members: 0, running: 0, tasks: 
 
 test('unsupported: no services yields ok:true + unsupported string + empty teams/projects', () => {
   const snapshot = createSnapshot(createFakeContext())
-  assert.equal(snapshot.version, 2)
+  assert.equal(snapshot.version, 3)
   assert.equal(snapshot.ok, true)
   assert.equal(typeof snapshot.unsupported, 'string')
   assert.ok(snapshot.unsupported.length > 0)
@@ -467,7 +536,7 @@ test('one team: members, project fallback, enrichment, counts, tasks, and activi
   const { services } = buildTeamServices()
   const snapshot = createSnapshot(createFakeContext(services))
 
-  assert.equal(snapshot.version, 2)
+  assert.equal(snapshot.version, 3)
   assert.equal(snapshot.ok, true)
   assert.equal(snapshot.unsupported, null)
   assert.equal(snapshot.teams.length, 1)
@@ -479,6 +548,10 @@ test('one team: members, project fallback, enrichment, counts, tasks, and activi
 
   // project: no workspace registry -> synthetic project from the Lead session header.cwd
   assert.deepEqual(team.project, { id: `cwd:${ROOT_CWD}`, title: 'team', path: ROOT_CWD })
+
+  // v3 stats: no sessionProjections service mounted and no creation-header createdAt
+  assert.deepEqual(team.stats, NULL_TEAM_STATS)
+  for (const member of team.members) assert.deepEqual(member.stats, NULL_MEMBER_STATS)
 
   // counts: 2 members (running), 4 tasks (1 in_progress, 1 blocked pending, 1 completed, 1 ready pending)
   assert.deepEqual(team.counts, {
@@ -1008,6 +1081,342 @@ test('projects aggregate listed teams only, with activeTeams/teams/title orderin
 })
 
 // ---------------------------------------------------------------------------
+// v3 session stats (optional sessionProjections service)
+// ---------------------------------------------------------------------------
+
+test('stats: member and team stats map the projections (tokens, work/idle, ratio, live)', () => {
+  const createdAt = FIXED_NOW - 600_000
+  const projections = {
+    [ROOT_ID]: {
+      sessionStats: { turns: 8, steps: 21, llmMs: 90000, toolMs: 20000, ttftMs: 3000, ttftSteps: 5, decodeMs: 500, decodeTokens: 100 },
+      tokenUsage: { uncachedInputTokens: 4567, outputTokens: 15544, cacheReadTokens: 90000, cacheWriteTokens: 1000 },
+    },
+    [TEAMMATE_ID]: {
+      sessionStats: { turns: 3, steps: 5, llmMs: 40000, toolMs: 10000, ttftMs: 1000, ttftSteps: 2, decodeMs: 200, decodeTokens: 50 },
+      tokenUsage: { uncachedInputTokens: 1000, outputTokens: 500, cacheReadTokens: 2000, cacheWriteTokens: 0 },
+    },
+  }
+  const { services } = buildTeamServices({ createdAt, projections })
+  const snapshot = createSnapshot(createFakeContext(services), FIXED_NOW)
+  const team = snapshot.teams[0]
+
+  const lead = team.members[0]
+  assert.deepEqual(lead.stats, {
+    turns: 8,
+    steps: 21,
+    tokens: { total: 111111, uncachedInput: 4567, cacheRead: 90000, cacheWrite: 1000, output: 15544 },
+    llmMs: 90000,
+    toolMs: 20000,
+    workingMs: 110000,
+    idleMs: 490000,
+    wallMs: 600000,
+    workingRatio: 0.1833,
+    live: true,
+  })
+
+  const reviewer = team.members[1]
+  assert.deepEqual(reviewer.stats, {
+    turns: 3,
+    steps: 5,
+    tokens: { total: 3500, uncachedInput: 1000, cacheRead: 2000, cacheWrite: 0, output: 500 },
+    llmMs: 40000,
+    toolMs: 10000,
+    workingMs: 50000,
+    idleMs: 550000,
+    wallMs: 600000,
+    workingRatio: 0.0833,
+    live: true,
+  })
+
+  assert.deepEqual(team.stats, {
+    turns: 11,
+    steps: 26,
+    tokens: { total: 114611, uncachedInput: 5567, cacheRead: 92000, cacheWrite: 1000, output: 16044 },
+    llmMs: 130000,
+    toolMs: 30000,
+    workingMs: 160000,
+    idleMs: 1040000,
+    wallMs: 1200000,
+    workingRatio: 0.1333,
+  })
+
+  // v2 fields/behavior are untouched by the stats addition.
+  assert.equal(team.id, ROOT_ID)
+  assert.equal(team.active, true)
+  assert.deepEqual(team.project, { id: `cwd:${ROOT_CWD}`, title: 'team', path: ROOT_CWD })
+  assert.equal(team.counts.members, 2)
+  assert.equal(team.counts.inProgress, 1)
+  assert.equal(snapshot.totals.activeTeams, 1)
+  assert.equal(snapshot.projects.length, 1)
+  assertLossless(snapshot)
+})
+
+test('stats: missing sessionProjections yields all-null member and team stats', () => {
+  const { services } = buildTeamServices()
+  const snapshot = createSnapshot(createFakeContext(services), FIXED_NOW)
+  const team = snapshot.teams[0]
+  assert.deepEqual(team.stats, NULL_TEAM_STATS)
+  for (const member of team.members) assert.deepEqual(member.stats, NULL_MEMBER_STATS)
+  assertLossless(snapshot)
+})
+
+test('stats: throwing or garbage stateOf degrades to nulls without throwing', () => {
+  const createdAt = FIXED_NOW - 30_000
+  const throwing = buildTeamServices({ createdAt })
+  throwing.services.sessionProjections = {
+    stateOf() {
+      throw new Error('projection registry broke')
+    },
+  }
+  let snapshot
+  assert.doesNotThrow(() => {
+    snapshot = createSnapshot(createFakeContext(throwing.services), FIXED_NOW)
+  })
+  const thrownTeam = snapshot.teams[0]
+  for (const member of thrownTeam.members) {
+    assert.equal(member.stats.turns, null)
+    assert.equal(member.stats.steps, null)
+    assert.equal(member.stats.tokens, null)
+    assert.equal(member.stats.workingMs, null)
+    assert.equal(member.stats.idleMs, null)
+    assert.equal(member.stats.workingRatio, null)
+    assert.equal(member.stats.wallMs, 30000) // wall time survives a projection failure
+    assert.equal(member.stats.live, true)
+  }
+  assert.equal(thrownTeam.stats.turns, null)
+  assert.equal(thrownTeam.stats.tokens, null)
+  assert.equal(thrownTeam.stats.workingRatio, null)
+  assert.equal(thrownTeam.stats.wallMs, 60000)
+  assertLossless(snapshot)
+
+  const garbage = buildTeamServices({
+    createdAt,
+    projections: {
+      [ROOT_ID]: { sessionStats: 'garbage', tokenUsage: [1, 2, 3] },
+      [TEAMMATE_ID]: {
+        sessionStats: { turns: 'x', steps: Number.NaN, llmMs: Number.POSITIVE_INFINITY, toolMs: -5 },
+        tokenUsage: { uncachedInputTokens: 'oops' },
+      },
+    },
+  })
+  const garbageSnapshot = createSnapshot(createFakeContext(garbage.services), FIXED_NOW)
+  const garbageTeam = garbageSnapshot.teams[0]
+  for (const member of garbageTeam.members) {
+    assert.equal(member.stats.turns, null)
+    assert.equal(member.stats.tokens, null)
+    assert.equal(member.stats.llmMs, null)
+    assert.equal(member.stats.toolMs, null)
+    assert.equal(member.stats.workingMs, null)
+    assert.equal(member.stats.wallMs, 30000)
+  }
+  assert.equal(garbageTeam.stats.tokens, null)
+  assertLossless(garbageSnapshot)
+})
+
+test('stats: missing or invalid session createdAt leaves wall/idle/ratio null', () => {
+  const projections = {
+    [ROOT_ID]: { sessionStats: { turns: 1, steps: 1, llmMs: 1000, toolMs: 500 } },
+    [TEAMMATE_ID]: { sessionStats: { turns: 1, steps: 1, llmMs: 1000, toolMs: 500 } },
+  }
+  const cases = [undefined, null, 'not-a-number', -100, Number.POSITIVE_INFINITY]
+  for (const createdAt of cases) {
+    const { services } = buildTeamServices({ createdAt, projections })
+    const snapshot = createSnapshot(createFakeContext(services), FIXED_NOW)
+    const team = snapshot.teams[0]
+    for (const member of team.members) {
+      assert.equal(member.stats.turns, 1)
+      assert.equal(member.stats.workingMs, 1500)
+      assert.equal(member.stats.wallMs, null)
+      assert.equal(member.stats.idleMs, null)
+      assert.equal(member.stats.workingRatio, null)
+      assert.equal(member.stats.live, false)
+    }
+    assert.equal(team.stats.workingMs, 3000)
+    assert.equal(team.stats.wallMs, null)
+    assert.equal(team.stats.idleMs, null)
+    assert.equal(team.stats.workingRatio, null)
+    assertLossless(snapshot)
+  }
+})
+
+test('stats: zero usage totals 0 and missing tokenUsage stays null', () => {
+  const createdAt = FIXED_NOW - 10_000
+  const projections = {
+    [ROOT_ID]: {
+      sessionStats: { turns: 2, steps: 3, llmMs: 1000, toolMs: 500 },
+      tokenUsage: { uncachedInputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 },
+    },
+    [TEAMMATE_ID]: { sessionStats: { turns: 1, steps: 1, llmMs: 0, toolMs: 0 } },
+  }
+  const { services } = buildTeamServices({ createdAt, projections })
+  const snapshot = createSnapshot(createFakeContext(services), FIXED_NOW)
+  const team = snapshot.teams[0]
+
+  assert.deepEqual(team.members[0].stats.tokens, {
+    total: 0,
+    uncachedInput: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    output: 0,
+  })
+  assert.equal(team.members[1].stats.tokens, null) // sessionStats present, tokenUsage absent
+  assert.equal(team.members[1].stats.turns, 1)
+  assert.equal(team.members[1].stats.workingMs, 0)
+  assert.equal(team.members[1].stats.idleMs, 10000)
+  assert.equal(team.members[1].stats.workingRatio, 0)
+
+  assert.deepEqual(team.stats.tokens, { total: 0, uncachedInput: 0, cacheRead: 0, cacheWrite: 0, output: 0 })
+  assert.equal(team.stats.turns, 3)
+  assert.equal(team.stats.workingMs, 1500)
+  assert.equal(team.stats.idleMs, 18500)
+  assert.equal(team.stats.wallMs, 20000)
+  assert.equal(team.stats.workingRatio, 0.075)
+
+  // A partially reported usage object counts missing buckets as 0.
+  const partial = buildTeamServices({ projections: { [ROOT_ID]: { tokenUsage: { cacheReadTokens: 42 } } } })
+  const partialSnapshot = createSnapshot(createFakeContext(partial.services), FIXED_NOW)
+  assert.deepEqual(partialSnapshot.teams[0].members[0].stats.tokens, {
+    total: 42,
+    uncachedInput: 0,
+    cacheRead: 42,
+    cacheWrite: 0,
+    output: 0,
+  })
+  assertLossless(snapshot)
+  assertLossless(partialSnapshot)
+})
+
+test('stats: team aggregation sums known fields and keeps mixed members null-safe', () => {
+  const createdAt = FIXED_NOW - 600_000
+  const members = [
+    { id: 'session-partial', name: 'partial', role: 'teammate', status: 'running', description: 'p', diagnostics: [] },
+    { id: 'session-none', name: 'none', role: 'teammate', status: 'inactive', description: 'n', diagnostics: [] },
+  ]
+  const projections = {
+    'session-mixed': {
+      sessionStats: { turns: 8, llmMs: 90000 },
+      tokenUsage: { uncachedInputTokens: 1000, outputTokens: 500, cacheReadTokens: 2000, cacheWriteTokens: 0 },
+    },
+    'session-partial': {
+      sessionStats: { turns: 2, steps: 5, llmMs: 10000, toolMs: 5000 },
+      tokenUsage: { uncachedInputTokens: 100, outputTokens: 50, cacheReadTokens: 0, cacheWriteTokens: 0 },
+    },
+  }
+  const fixture = buildSimpleTeam({ teamId: 'session-mixed', createdAt, members, projections })
+  const snapshot = createSnapshot(createFakeContext(fixture.services), FIXED_NOW)
+  const team = snapshot.teams[0]
+  assert.equal(team.members.length, 3)
+
+  const [lead, partial, none] = team.members
+  assert.deepEqual(lead.stats, {
+    turns: 8,
+    steps: null,
+    tokens: { total: 3500, uncachedInput: 1000, cacheRead: 2000, cacheWrite: 0, output: 500 },
+    llmMs: 90000,
+    toolMs: null,
+    workingMs: null,
+    idleMs: null,
+    wallMs: 600000,
+    workingRatio: null,
+    live: true,
+  })
+  assert.deepEqual(partial.stats, {
+    turns: 2,
+    steps: 5,
+    tokens: { total: 150, uncachedInput: 100, cacheRead: 0, cacheWrite: 0, output: 50 },
+    llmMs: 10000,
+    toolMs: 5000,
+    workingMs: 15000,
+    idleMs: 585000,
+    wallMs: 600000,
+    workingRatio: 0.025,
+    live: true,
+  })
+  assert.deepEqual(none.stats, {
+    turns: null,
+    steps: null,
+    tokens: null,
+    llmMs: null,
+    toolMs: null,
+    workingMs: null,
+    idleMs: null,
+    wallMs: 600000,
+    workingRatio: null,
+    live: false,
+  })
+
+  assert.deepEqual(team.stats, {
+    turns: 10,
+    steps: 5,
+    tokens: { total: 3650, uncachedInput: 1100, cacheRead: 2000, cacheWrite: 0, output: 550 },
+    llmMs: 100000,
+    toolMs: 5000,
+    workingMs: 15000,
+    idleMs: 585000,
+    wallMs: 1800000,
+    workingRatio: 0.025,
+  })
+  assertLossless(snapshot)
+})
+
+test('stats: workingRatio clamps/rounds and is null without a positive denominator', () => {
+  // working > wall: idle clamps to 0 and the ratio is exactly 1.
+  const overworked = buildTeamServices({
+    createdAt: FIXED_NOW - 10_000,
+    projections: {
+      [ROOT_ID]: { sessionStats: { turns: 0, steps: 0, llmMs: 20000, toolMs: 0 } },
+      [TEAMMATE_ID]: { sessionStats: { turns: 0, steps: 0, llmMs: 20000, toolMs: 0 } },
+    },
+  })
+  const overworkedSnapshot = createSnapshot(createFakeContext(overworked.services), FIXED_NOW)
+  assert.equal(overworkedSnapshot.teams[0].members[0].stats.idleMs, 0)
+  assert.equal(overworkedSnapshot.teams[0].members[0].stats.workingRatio, 1)
+  assert.equal(overworkedSnapshot.teams[0].stats.workingRatio, 1)
+
+  // working 0 with wall > 0: ratio 0.
+  const idling = buildTeamServices({
+    createdAt: FIXED_NOW - 10_000,
+    projections: {
+      [ROOT_ID]: { sessionStats: { turns: 0, steps: 0, llmMs: 0, toolMs: 0 } },
+      [TEAMMATE_ID]: { sessionStats: { turns: 0, steps: 0, llmMs: 0, toolMs: 0 } },
+    },
+  })
+  const idlingSnapshot = createSnapshot(createFakeContext(idling.services), FIXED_NOW)
+  assert.equal(idlingSnapshot.teams[0].members[0].stats.workingRatio, 0)
+  assert.equal(idlingSnapshot.teams[0].stats.workingRatio, 0)
+
+  // zero-length observation window: no denominator -> null.
+  const emptyWindow = buildTeamServices({
+    createdAt: FIXED_NOW,
+    projections: {
+      [ROOT_ID]: { sessionStats: { turns: 0, steps: 0, llmMs: 0, toolMs: 0 } },
+      [TEAMMATE_ID]: { sessionStats: { turns: 0, steps: 0, llmMs: 0, toolMs: 0 } },
+    },
+  })
+  const emptyWindowSnapshot = createSnapshot(createFakeContext(emptyWindow.services), FIXED_NOW)
+  assert.equal(emptyWindowSnapshot.teams[0].members[0].stats.wallMs, 0)
+  assert.equal(emptyWindowSnapshot.teams[0].members[0].stats.workingRatio, null)
+  assert.equal(emptyWindowSnapshot.teams[0].members[0].stats.live, true)
+  assert.equal(emptyWindowSnapshot.teams[0].stats.workingRatio, null)
+
+  // rounding: 20000 / 60000 -> 0.3333.
+  const rounded = buildTeamServices({
+    createdAt: FIXED_NOW - 60_000,
+    projections: {
+      [ROOT_ID]: { sessionStats: { turns: 0, steps: 0, llmMs: 20000, toolMs: 0 } },
+      [TEAMMATE_ID]: { sessionStats: { turns: 0, steps: 0, llmMs: 20000, toolMs: 0 } },
+    },
+  })
+  const roundedSnapshot = createSnapshot(createFakeContext(rounded.services), FIXED_NOW)
+  assert.equal(roundedSnapshot.teams[0].members[0].stats.workingRatio, 0.3333)
+  assert.equal(roundedSnapshot.teams[0].stats.workingRatio, 0.3333)
+  assertLossless(overworkedSnapshot)
+  assertLossless(idlingSnapshot)
+  assertLossless(emptyWindowSnapshot)
+  assertLossless(roundedSnapshot)
+})
+
+// ---------------------------------------------------------------------------
 // defensive normalization
 // ---------------------------------------------------------------------------
 
@@ -1216,11 +1625,14 @@ test('snapshot stays lossless even when roster/task rows contain undefined and j
   assert.equal(member.status, 'inactive')
   assert.equal(member.active, false)
   assert.deepEqual(member.diagnostics, ['diag'])
+  assert.deepEqual(member.stats, NULL_MEMBER_STATS)
   const teammate = snapshot.teams[0].members[1]
   assert.equal(teammate.name, 'helper')
   assert.equal(teammate.context, null)
   assert.equal(teammate.status, 'failed')
   assert.equal(teammate.active, false)
+  assert.deepEqual(teammate.stats, NULL_MEMBER_STATS)
+  assert.deepEqual(snapshot.teams[0].stats, NULL_TEAM_STATS)
   const task = snapshot.teams[0].tasks[0]
   assert.equal(task.id, 'task-1')
   assert.equal(task.revision, 0)
@@ -1234,7 +1646,7 @@ test('snapshot stays lossless even when roster/task rows contain undefined and j
 // HTTP route
 // ---------------------------------------------------------------------------
 
-test('route: GET snapshot -> 200 JSON v2 with cache headers; other requests -> 404', async () => {
+test('route: GET snapshot -> 200 JSON v3 with cache headers; other requests -> 404', async () => {
   const { services } = buildTeamServices()
   const handler = createRouteHandler(createFakeContext(services))
 
@@ -1245,17 +1657,20 @@ test('route: GET snapshot -> 200 JSON v2 with cache headers; other requests -> 4
   assert.equal(okResponse.headers['cache-control'], 'no-store')
   const body = JSON.parse(okResponse.body)
   assert.equal(body.ok, true)
-  assert.equal(body.version, 2)
+  assert.equal(body.version, 3)
   assert.equal(body.teams.length, 1)
   assert.equal(body.projects.length, 1)
   assert.equal(body.totals.activeTeams, 1)
+  // v3 stats are on the wire even when the projections are unavailable.
+  assert.deepEqual(body.teams[0].stats, NULL_TEAM_STATS)
+  assert.deepEqual(body.teams[0].members[0].stats, NULL_MEMBER_STATS)
   assertLossless(body)
 
   const notFoundResponse = createFakeResponse()
   await handler({ method: 'POST', url: '/api/team-console/snapshot' }, notFoundResponse)
   assert.equal(notFoundResponse.statusCode, 404)
   assert.equal(JSON.parse(notFoundResponse.body).ok, false)
-  assert.equal(JSON.parse(notFoundResponse.body).version, 2)
+  assert.equal(JSON.parse(notFoundResponse.body).version, 3)
 
   const wrongPathResponse = createFakeResponse()
   await handler({ method: 'GET', url: '/api/team-console/other' }, wrongPathResponse)
@@ -1281,7 +1696,7 @@ test('route: aggregation failure -> 500 valid JSON, handler never rejects', asyn
   await assert.doesNotReject(() => handler({ method: 'GET', url: '/api/team-console/snapshot' }, response))
   assert.equal(response.statusCode, 500)
   const body = JSON.parse(response.body)
-  assert.equal(body.version, 2)
+  assert.equal(body.version, 3)
   assert.equal(body.ok, false)
   assert.equal(body.error, 'boom')
   assert.deepEqual(body.teams, [])
@@ -1318,7 +1733,7 @@ test('route: DSH connection admission is enforced when the connection service is
   assert.equal(anonymousResponse.headers['content-type'], 'application/json; charset=utf-8')
   assert.equal(anonymousResponse.headers['cache-control'], 'no-store')
   const anonymousBody = JSON.parse(anonymousResponse.body)
-  assert.equal(anonymousBody.version, 2)
+  assert.equal(anonymousBody.version, 3)
   assert.equal(anonymousBody.ok, false)
   assert.equal(anonymousBody.error, 'unauthorized')
   assert.deepEqual(anonymousBody.teams, [])

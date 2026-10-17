@@ -1,6 +1,6 @@
 {
   "name": "dsh-agent-team-console",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Read-only Agent Team console for the DeepSeek Harness Web UI: live roster, shared task board, and collaboration activity from one same-origin JSON snapshot route.",
   "license": "MIT",
   "author": "kkomia",

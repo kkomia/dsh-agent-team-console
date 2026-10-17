@@ -1,8 +1,8 @@
 # Agent Team Console
 
 Read-only Agent Teams dashboard for the DeepSeek Harness Web UI (`dsh-agent-team-console`): a
-project-scoped, in-progress-first view of the live roster, shared tasks, and collaboration activity in
-one first-class main panel.
+project-scoped, visual-first live stage for every team, with workspace-first headers, animated agent
+nodes, and rounds / token / working-time statistics in one first-class main panel.
 
 English | [中文](README.zh.md)
 
@@ -22,11 +22,12 @@ quick check while you are inside the Lead conversation, but it is not a page of 
 Agent Team Console keeps the same read-only contract and adds a sidebar entry plus a full main
 panel for people who keep a team running for a long stretch:
 
-- A project filter and an in-progress-first status strip that keep current work visible at a glance.
-- A compact active-first roster with live status, model information, and last activity.
-- Shared tasks grouped in-progress first, then compact pending rows and a collapsed completed group,
-  with owners, readiness markers for pending tasks, and advisory write scopes.
-- A compact activity list derived from the Lead session activity log.
+- A project filter and a compact status strip covering in-progress tasks, running members, token
+  usage, blocked tasks, and pending tasks.
+- Workspace-first team headers with a working-vs-idle donut plus team rounds and token totals.
+- An animated SVG agent stage: one node per member, sized by token usage and ringed by working time.
+- A one-line task summary with in-progress rows on demand, so the page stays visual instead of a wall
+  of text.
 
 It is a plain DeepSeek Harness (DSH) Web plugin: no build step for users, no npm dependencies, and no
 external services.
@@ -38,35 +39,41 @@ external services.
 - **Project filter.** When more than one project (workspace) has live teams, a select appears in the
   header. It defaults to "All projects" and narrows the status strip and the team list to one project;
   the choice is client-side and is not persisted.
-- **In-progress-first status strip.** A single compact row of four chips: in-progress tasks, running
-  members (running / total), blocked tasks (pending tasks that are not ready), and pending tasks. Zero
-  values stay visible but muted.
-- **Active-first team sections.** Teams are ordered active first, then by most recent activity. Active
-  teams (a running or provisioning member, or an in-progress task) expand by default; idle teams are
-  collapsed behind a header that still shows the project, Lead, counters, and last activity.
-- **Roster chips.** One compact wrapping row per team, active members first (running or provisioning,
-  then idle, then failed). Each chip shows the avatar initial, name, role, and status; the model and
-  last activity are in its tooltip. Up to 8 members are shown, with a "N more" chip for the rest.
-- **In-progress-first tasks.** In-progress task cards come first and carry the strongest visual
-  weight: subject, owner, advisory write scopes, and an expandable description. In-progress tasks are
-  claimed work and never show a blocked warning. Pending tasks are compact one-line rows: a ready task
-  (all blockers completed) shows a ready marker, while a task whose blockers are still open shows a
-  blocked marker with the blocker ids when known. Completed tasks sit behind a collapsed "Completed N"
-  toggle per team.
-- **Compact activity.** The latest 8 team and task events for a team, newest first, with relative time
-  and localized action labels.
+- **In-progress-first status strip.** A single compact row of five chips: in-progress tasks, running
+  members (running / total), token usage for the current selection, blocked tasks (pending tasks that
+  are not ready), and pending tasks. Zero values stay visible but muted.
+- **Workspace-first team sections.** Teams are ordered active first, then by most recent activity.
+  Each team header starts with the prominent workspace/project name (falling back to "No project",
+  "未分组" in the Chinese UI), then the Lead name and role, a status dot, a working-vs-idle donut with
+  a "work · idle" caption, team rounds, team token totals, an in-progress count when non-zero, and the
+  expand/collapse toggle. Active teams expand by default; idle teams stay collapsed.
+- **Animated agent stage.** The text roster is replaced by an SVG stage with one node per member (Lead
+  first and slightly larger; up to 8 shown, then a "+N" overflow node). Node radius scales with token
+  usage, an outer arc shows the working ratio, and the status ring animates: running pulses and
+  orbits, provisioning spins a dashed ring, idle is muted and static, and failed is a static error
+  ring. Under each node sits a tiny "N rounds · X tok" line.
+- **Member details on hover or focus.** Hovering or focusing a node opens a compact detail card with
+  the model, rounds, steps, token breakdown (uncached input, cache read, cache write, output, total),
+  and working and idle time. Clicking the node opens the member's session when workspace navigation is
+  available.
+- **Compact task summary.** Each team shows one line with in-progress, pending, and blocked counts and
+  a small expand toggle. Expanding shows only the in-progress tasks as one-line rows (subject, owner);
+  pending and completed tasks stay counts only. Blocked follows the readiness rule: only a pending
+  task with `ready === false` is blocked, and in-progress tasks are never shown as blocked.
+- **Activity stays in the API.** The snapshot still carries the bounded activity list for API
+  consumers, but the v1.2 panel no longer renders it.
 - **Multiple teams and projects.** One collapsible section per live team, filtered by project when a
   project is selected.
 - **Honest states.** A loading skeleton on first load, an error card with retry, a "showing the last
   successful snapshot" hint after a failed poll, an unsupported-service notice, and an empty state.
 - **Bilingual.** All visible copy goes through the DSH client locale service, with Chinese and
   English dictionaries kept in sync; the panel follows the host language.
-- **Theme-native.** Colors, borders, and backgrounds come only from `--dsw-*` theme tokens, so the
-  panel follows dark and light themes. Reduced motion is respected, and member chips are keyboard
-  accessible.
+- **Theme-native.** Colors, borders, and SVG art come only from `--dsw-*` theme tokens, so the panel
+  follows dark and light themes. Stage nodes are keyboard accessible and every animation is disabled
+  under reduced motion.
 - **Polling.** The panel refreshes a same-origin JSON snapshot every 2 seconds while it is mounted and
   the tab is visible, pauses while the tab is hidden, and offers a manual refresh button.
-- **Optional navigation.** When the host exposes `uiWorkspace.openSession`, clicking a member chip
+- **Optional navigation.** When the host exposes `uiWorkspace.openSession`, clicking a stage node
   opens that member's session. When it does not, the panel stays a read-only page.
 
 ## Requirements and compatibility
@@ -77,6 +84,9 @@ external services.
 - **The official experimental Agent Teams bundle must be mounted in the same profile.** This plugin
   visualizes teams that already exist; it does not provide the Agent Teams service itself. Without
   that service the panel shows a clear "not mounted" notice instead of failing.
+- **Optional session projections.** Rounds, token usage, and working / idle times come from the stock
+  DSH `sessionStats` and `tokenUsage` projections. They are optional: without them the panel still
+  renders the stage and shows dashes for statistics.
 - **A Web-capable profile.** The install examples below use the `desktop` profile; replace `desktop`
   with your own Web profile name (`web`, and so on) if it differs.
 - **No separate Node.js installation is needed to use the plugin.** Node.js 22.19 or newer is only
@@ -127,65 +137,65 @@ keeps polling every 2 seconds while it is visible.
 
 ### Read the header
 
-The header shows the page title and subtitle, the project filter when it applies, a live indicator
-(pulsing while any member is running), the time of the last successful update, and a refresh button
-that spins while a manual refresh is in flight.
+The header shows the page title and subtitle (a one-line description of the live stage), the project
+filter when it applies, a live indicator (pulsing while any member is running), the time of the last
+successful update, and a refresh button that spins while a manual refresh is in flight.
 
 ### Filter by project
 
 When the snapshot lists more than one project (workspace), a project select appears in the header. It
-starts at "All projects"; choosing a project narrows the status strip and the team sections to that
-project's teams. The filter is client-side only: it is not saved, and remounting the panel resets it
-to "All projects". Projects with duplicate titles get a short path tail in their option label so they
-stay distinguishable. Teams whose project cannot be resolved appear under "All projects" only.
+starts at "All projects"; choosing a project narrows the status strip, its token total, and the team
+sections to that project's teams; each team header shows its workspace name. The filter is
+client-side only: it is not saved, and remounting the panel resets it to "All projects". Projects with
+duplicate titles get a short path tail in their option label so they stay distinguishable. Teams
+whose project cannot be resolved appear under "All projects" only.
 
 ### Read the status strip
 
-The status strip is a compact row of four chips for the current selection: in-progress tasks, running
-members (running / total), blocked tasks, and pending tasks. The blocked chip counts pending tasks
-that are not ready; in-progress and completed tasks are never counted as blocked. A chip with a value
-of zero stays visible but is muted. Completed tasks are not counted in the strip; they appear per team
-behind the completed toggle.
+The status strip is a compact row of five chips for the current selection: in-progress tasks, running
+members (running / total), token usage summed across the filtered teams (shown compactly, such as
+`1.2M tok`), blocked tasks, and pending tasks. The blocked chip counts pending tasks that are not
+ready; in-progress and completed tasks are never counted as blocked. A chip with a value of zero stays
+visible but is muted. Completed tasks are not counted in the strip; they appear only in the per-team
+task summary.
 
 ### Read the team sections
 
-Teams are listed active first, then by most recent activity. Each team header shows a status dot, the
-project chip when known, the Lead name and role, in-progress, member, and blocked counters (blocked
-counts pending tasks that are not ready and is shown only when non-zero), and the last activity time.
-Active teams are expanded by default; idle teams start collapsed and can be expanded with the header
-toggle. Expansion state is kept while the panel stays mounted.
+Teams are listed active first, then by most recent activity. Each team header starts with the
+prominent workspace/project name, followed by the Lead name and role, a status dot, a working-vs-idle
+donut with a "work · idle" caption, team rounds, team token totals, and an in-progress count when
+non-zero. Clicking the header expands or collapses the team; active teams start expanded and idle
+teams start collapsed. Expansion state is kept while the panel stays mounted.
 
-### Read the roster
+### Read the agent stage
 
-The roster is a compact row of member chips, active members first: running and provisioning, then
-idle, then failed. Each chip shows the avatar initial, name, role tag, and a status dot with its label;
-hovering it reveals the model and last activity time. Up to 8 members are shown per team, with an
-"N more" chip when the roster is longer.
+The stage is an animated SVG scene with one node per member, Lead first. Node radius grows with token
+usage (log-scaled against the team's busiest member), and an outer arc shows the member's working
+ratio. Status is visual: a running member has a pulsing ring and an orbiting dot, a provisioning
+member spins a dashed ring, idle members are muted and static, and failed members carry a static error
+ring. Each node shows the member's initial, a short name, and a tiny "N rounds · X tok" line. Teams
+with more than 8 members show a "+N" overflow node. Animations respect the host's reduced-motion
+preference.
 
-### Read the task sections
+### Read the node details
 
-Tasks are grouped in-progress first. In-progress task cards show the subject, owner, advisory write
-scopes, and a description that can be expanded; they carry no blocked warning, because a task in
-progress is claimed work. Pending tasks are compact one-line rows with the owner and a readiness
-marker: a pending task is ready when all of its blockers are completed, and only a pending task that
-is not ready shows a blocked marker with the blocker ids when known. Readiness is derived by the host:
-`ready` is true only for pending tasks whose blockers are all completed, and the retained `blockedBy`
-list does not by itself mean a task is blocked. Completed tasks are collapsed behind a "Completed N"
-toggle per team; expanding it shows dimmed one-line rows.
+Hovering or focusing a node opens a detail card below the stage: model, rounds, steps, the token
+breakdown (uncached input, cache read, cache write, output, total), and working and idle time. The
+card closes when the pointer or focus leaves the node.
 
-### Read the activity
+### Read the task summary
 
-The activity list shows up to 8 of the latest team and task events for a team, newest first, with
-relative timestamps. Task actions are shown with localized action labels, so a claimed task reads like
-"task-3 · claimed · reviewer" in English or "task-3 · 认领 · reviewer" in Chinese; the raw server-side
-action label only appears in fallback text. Event shapes the plugin does not recognize are shown
-through a readable fallback label instead of being dropped or throwing.
+Each team body ends with a single summary line: in-progress, pending, and blocked counts plus a small
+expand toggle. Expanding it shows only the in-progress tasks as compact one-line rows with the subject
+and owner; pending and completed tasks stay as counts. Readiness is derived by the host: a pending task
+is ready when all of its blockers are completed, and only a pending task that is not ready is counted
+and shown as blocked. In-progress tasks are claimed work and never show a blocked warning.
 
 ### Open a member session
 
-Click a member chip (or focus it and press Enter or Space) to open that member's session when the
-host provides workspace navigation. This is an optional convenience: when the service is not
-available, chips are not clickable.
+Click a stage node (or focus it and press Enter or Space) to open that member's session when the host
+provides workspace navigation. This is an optional convenience: when the service is not available,
+nodes are not clickable.
 
 ### Refresh manually
 
@@ -200,7 +210,7 @@ continues as usual.
 - **Stale.** A later poll failed after a successful load. The last data stays visible with a warning
   hint until a poll succeeds again.
 - **Empty.** No live team was found. The empty state explains that teams appear here automatically
-  once teammates or shared tasks exist, and that idle teams stay listed when they exist.
+  once teammates or shared tasks exist, and that idle teams stay listed collapsed when they exist.
 
 ## Read-only and privacy
 
@@ -240,8 +250,10 @@ flowchart LR
     R["GET /api/team-console/snapshot"]
     S["agentTeams / agents / sessions services"]
     W["workspaceRegistry (optional)"]
+    J["sessionProjections (optional)"]
     R --> S
     R --> W
+    R --> J
   end
   P -- "fetch snapshot, every 2s, same origin" --> R
 ```
@@ -254,16 +266,16 @@ flowchart LR
 
 On every request the handler first applies the optional DSH `connection` service's admission check;
 a request that fails the Host/Origin fence or browser-session admission gets a JSON 401/403 before any
-route logic. It then resolves the optional `agentTeams`, `agents`, `sessions`, and
-`workspaceRegistry` services through `ctx.get(...)`. If Agent Teams is missing it returns a valid
+route logic. It then resolves the optional `agentTeams`, `agents`, `sessions`, `workspaceRegistry`, and
+`sessionProjections` services through `ctx.get(...)`. If Agent Teams is missing it returns a valid
 snapshot with an `unsupported` reason. Otherwise it enumerates live agents, keeps the ones with a Lead
-role, reads the roster and task board for each team, enriches members from their session activity,
-normalizes team and task events into activity entries, resolves each team's project (workspace
-registry first, then the Lead session working directory, otherwise null), and computes the per-team
-counts and `active` flags. It then aggregates the top-level `totals` and `projects` and returns one
-JSON-safe snapshot with contract version 2. Teams are ordered active first, then by most recent
-activity. Unexpected aggregation failures become a valid JSON 500 body; unknown routes become a JSON
-404 body.
+role, reads the roster and task board for each team, enriches members from a bounded session tail,
+resolves each team's project, and reads each member's session statistics from the optional session
+projections (`sessionStats` and `tokenUsage`): two bounded projection reads per member, never a
+session-log scan for stats. It computes turns, steps, token buckets, working / idle / wall time, and a
+working ratio, aggregates them per team, and returns one JSON-safe snapshot with contract version 3.
+Teams are ordered active first, then by most recent activity. Unexpected aggregation failures become a
+valid JSON 500 body; unknown routes become a JSON 404 body.
 
 ### Client half (`client.js`)
 
@@ -273,14 +285,13 @@ Chinese and English locale dictionaries under the `agent-team-console` namespace
 `ctx.effect(...)`, then registers a `sidebar.panellist` entry (id `team-console`, order 20) and a
 `main` panel (key `team-console`).
 
-The panel keeps the project selection and the per-team expand/collapse state in local React state (no
-storage), renders the project filter and the compact status strip, and lays out one collapsible
-section per team. It renders one `<style>` element that uses only `--dsw-*` tokens, so styles
-disappear together with the panel. It polls the same-origin snapshot every 2 seconds while mounted and
-the tab is visible, keeps an in-flight guard, aborts the active request on unmount, and never attaches
-global listeners outside React effects. The host rebuilds the snapshot per request, so the view stays
-near live without a push channel, while the read-only guarantee stays easy to audit: no mutation call
-exists in either half.
+The panel keeps the project selection, the per-team expand state, and the per-team task-summary state
+in local React state (no storage), renders the project filter, the five-chip status strip, and one
+collapsible section per team whose header starts with the workspace name. The body is an animated SVG
+agent stage plus a compact task summary; the wire contract still carries the activity list but the
+panel does not render it. All styles and SVG animations come from one `<style>` element that uses only
+`--dsw-*` tokens, animations are disabled under reduced motion, and polling keeps the same
+2-second, visibility-aware, cleanup-safe behavior as before.
 
 ## Development
 
@@ -295,11 +306,12 @@ node scripts/ci-guard.mjs
 ```
 
 `npm run check` runs the syntax checks and the test suite, and `npm test` runs the tests alone. The
-tests use only Node built-ins and fake Cordis services; they cover the snapshot contract (version 2,
-project resolution, active ordering), unknown event shapes, JSON safety, and the 200/404/500 route
-behavior. `scripts/ci-guard.mjs` runs 32 checks over the cross-file DSH wiring (manifest, patch,
-exports, client registration, locale metadata, and the embedded client dictionary key parity), which
-is the part that can break without any unit test failing.
+suite currently has 39 tests that use only Node built-ins and fake Cordis services; they cover the
+snapshot contract (version 3, project resolution, active ordering, session stats and their optional
+degradation), unknown event shapes, JSON safety, and the 200/404/500 route behavior.
+`scripts/ci-guard.mjs` runs 32 checks over the cross-file DSH wiring (manifest, patch, exports, client
+registration, locale metadata, and the embedded client dictionary key parity), which is the part that
+can break without any unit test failing.
 
 To try a local change in a live app, install the package into a DSH profile (an absolute local path
 is accepted as an install spec), restart the app, and open the panel. Host log lines are prefixed
@@ -307,7 +319,7 @@ is accepted as an install spec), restart the app, and open the panel. Host log l
 
 To check a running instance's snapshot route from the command line, run
 `TEAM_CONSOLE_URL=http://127.0.0.1:10100 node scripts/verify-live.mjs`. It exits `0` when the route
-is reachable and the v2 contract matches, `1` when the route is unreachable or the contract is
+is reachable and the v3 contract matches, `1` when the route is unreachable or the contract is
 violated, and `2` when admission rejects the request as unauthenticated. A `2` is expected against a
 running DSH desktop app: the route enforces DSH connection admission, so an anonymous command-line
 probe is answered with a JSON 401 before any snapshot logic, while the authenticated browser UI
@@ -344,16 +356,20 @@ control.
 - **Only real teams are listed.** A team appears when it has more than one member or at least one
   shared task; an ordinary single-agent Lead session is not listed.
 - **The project filter is client-side.** It is not persisted and is hidden when only one project has
-  live teams. Teams whose project cannot be resolved appear under "All projects" only.
-- **Activity is derived.** The activity list comes from bounded reads of the Lead session's team and
-  task events: at most 40 entries are assembled on the host and the newest 8 are shown. Unknown event
-  shapes fall back to a generic label.
+  live teams. Teams whose project cannot be resolved appear under "All projects" only and show the
+  "No project" label.
+- **Stats are best effort.** Turns, steps, token usage, and working / idle times come from the
+  optional session projections; when they are unavailable the host emits nulls and the stage and
+  detail card show dashes. Stats never trigger a session-log scan.
+- **Activity is API-only.** The snapshot still carries the bounded activity list (at most 40 entries
+  per team) for API consumers, but the v1.2 panel does not render it.
+- **The stage shows up to 8 members.** Larger teams show a "+N" overflow node instead of every member.
 - **No mailbox timeline.** Peer messages are not shown; the official roster and task board are the
   source of truth.
 - **Navigation is optional.** Opening a member session depends on the optional `uiWorkspace` service;
   without it the panel remains a pure viewer.
-- **No controls, by design.** There is no spawn, rename, interrupt, claim, complete, or delete action,
-  and write scopes are shown as advisory metadata only.
+- **No controls, by design.** There is no spawn, rename, interrupt, claim, complete, or delete action;
+  write scopes and task descriptions stay advisory metadata in the API and are not actionable here.
 - **Web UI only.** The plugin affects the DSH Web client; CLI and headless surfaces are unchanged.
 
 ## License

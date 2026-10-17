@@ -7,6 +7,48 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-10-17
+
+Visual-first agent stage with snapshot contract version 3.
+
+### Added
+
+- Snapshot contract v3: per-member `stats` (turns, steps, token usage buckets, `llmMs`, `toolMs`,
+  `workingMs`, `idleMs`, `wallMs`, `workingRatio`, and `live`) and a per-team aggregated `stats` row
+  with recomputed `workingRatio`. Stats come from the optional `sessionProjections` service
+  (`sessionStats` and `tokenUsage`) with two bounded projection reads per member and no session-log
+  scans.
+- Optional `sessionProjections` service support: an absent service, a missing projection unit, or a
+  throwing read degrades every stat to null without failing the snapshot.
+- Workspace-first team headers: the project/workspace name now leads each team section, followed by
+  the Lead, a working-vs-idle donut with a work/idle caption, team rounds, team token totals, and the
+  in-progress count.
+- Animated SVG agent stage: one node per member (Lead first; up to 8 plus a "+N" overflow node), with
+  token-scaled node radius, a working-ratio arc ring, a running pulse/orbit, a provisioning dashed
+  spin, muted idle nodes, a static failed ring, and a tiny "N rounds · X tok" line.
+- Hover/focus member detail card: model, rounds, steps, token breakdown (uncached input, cache read,
+  cache write, output, total), and working / idle time.
+- Token-usage chip in the status strip (five chips total) and a compact per-team task summary line
+  (in-progress / pending / blocked) with an in-progress-only expand.
+- Host tests for the v3 stats mapping, missing/throwing projection degradation, ratio clamping, and
+  team aggregation (39 tests total).
+
+### Changed
+
+- Replaced the text roster chips with the animated SVG agent stage.
+- Replaced the in-progress task cards and collapsed task groups with a one-line task summary plus
+  on-demand in-progress rows.
+- Removed the activity list from the panel; the wire contract still carries it for API consumers.
+- Package version bumped to 1.2.0, and `verify-live` now validates the v3 contract.
+
+### Notes
+
+- The snapshot contract is now version 3. It adds fields only; the endpoint stays read-only,
+  same-origin, admission-checked, and mutation-free.
+- Session projections are optional: without them the panel still renders, with dashes for statistics.
+- No change to the plugin manifest wiring, admission behavior, polling transport, project filter, or
+  the zero-dependency policy.
+
 ## [1.1.0] - 2026-10-17
 
 Project-scoped, in-progress-first dashboard with snapshot contract version 2.

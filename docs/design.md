@@ -1,9 +1,9 @@
 # Agent Team Console: design notes
 
-Public design notes for the `dsh-agent-team-console` plugin, version 1.1.0 (snapshot contract version
-2). This document describes the architecture, the HTTP snapshot contract, the in-progress-first UI
-model, the polling lifecycle, the theme and accessibility model, and the current limitations. It is
-written for people who want to understand or extend the plugin; user-facing instructions live in
+Public design notes for the `dsh-agent-team-console` plugin, version 1.2.0 (snapshot contract version
+3). This document describes the architecture, the HTTP snapshot contract, the visual-first UI model,
+the polling lifecycle, the theme and accessibility model, and the current limitations. It is written
+for people who want to understand or extend the plugin; user-facing instructions live in
 [the README](../README.md).
 
 ## 1. Overview and goals
@@ -11,10 +11,11 @@ written for people who want to understand or extend the plugin; user-facing inst
 Agent Team Console is a read-only dashboard for Agent Teams in the DeepSeek Harness (DSH) Web UI. It
 adds a sidebar entry and a first-class main panel that shows, for every live team:
 
-- team-level counts in a compact status strip, scoped by an optional project filter;
-- a compact active-first roster with status, model, and recent activity;
-- shared tasks grouped in-progress first, with owners, blockers, and advisory write scopes;
-- a compact activity list of member and task events.
+- a project-scoped, workspace-first team header with a working-vs-idle donut and team statistics;
+- an animated SVG agent stage: one node per member, scaled by token usage and ringed by working time;
+- a compact task summary with in-progress rows on demand;
+- team and member statistics (rounds, steps, token usage, working / idle / wall time) derived from the
+  optional session projections.
 
 The goals that shaped the design:
 
@@ -22,15 +23,19 @@ The goals that shaped the design:
    services. The host half imports nothing; the client half borrows only React from the host.
 2. **Read-only by construction.** There is no mutation path to audit away: one read-only HTTP route,
    no request bodies, no write calls, no host timers, no filesystem access.
-3. **In-progress first.** The panel leads with what is happening now: active teams expand, in-progress
-   tasks come first, and idle or completed work collapses or shrinks out of the way.
-4. **Project-scoped.** A one-glance project filter keeps a multi-workspace setup scannable without
+3. **Visual-first.** The panel shows state as pictures and numbers instead of walls of text: animated
+   stage nodes, a working-vs-idle donut, and compact stat lines lead the page.
+4. **Stats over transcripts.** Rounds, token usage, and working time come from stock session
+   projections, not from rendering tool calls or event text.
+5. **In-progress first.** The panel leads with what is happening now: active teams expand, in-progress
+   tasks come first, and idle work stays collapsed or as counts.
+6. **Project-scoped.** A one-glance project filter keeps a multi-workspace setup scannable without
    adding configuration or persistence.
-5. **Native look and feel.** The panel uses DSH theme tokens and typography so it follows the host's
+7. **Native look and feel.** The panel uses DSH theme tokens and typography so it follows the host's
    dark and light themes, plus the panel's own accessibility conventions.
-6. **Defensive data handling.** The Agent Teams services are experimental; their views may change.
-   Unknown or malformed payloads must degrade to a readable fallback instead of throwing.
-7. **Bilingual.** Every visible string goes through the DSH client locale service, with Chinese and
+8. **Defensive data handling.** The Agent Teams and projection services are experimental; their views
+   may change. Unknown or malformed payloads must degrade to a readable fallback instead of throwing.
+9. **Bilingual.** Every visible string goes through the DSH client locale service, with Chinese and
    English dictionaries kept key-for-key in sync.
 
 ## 2. Non-goals
@@ -53,8 +58,9 @@ This plugin takes a different route that is fully within the public plugin surfa
 
 1. The **host half** aggregates the live view from the ordinary Host services `agentTeams`, `agents`,
    and `sessions`, optionally resolves project/workspace data through the `workspaceRegistry` service,
-   and exposes it as one JSON document over a same-origin HTTP route.
-2. The **client half** fetches that document from the browser and renders it.
+   optionally reads session statistics through the `sessionProjections` service, and exposes the
+   result as one JSON document over a same-origin HTTP route.
+2. The **client half** fetches that document from the browser and renders it as a visual agent stage.
 
 The pattern is common for small DSH Web plugins: register a route on the Web server, then `fetch` it
 from the same origin. It keeps the client bundle dependency-free, and it makes the read-only
@@ -74,10 +80,12 @@ flowchart LR
     G["agents"]
     S["sessions"]
     W["workspaceRegistry (optional)"]
+    J["sessionProjections (optional)"]
     R --> A
     R --> G
     R --> S
     R --> W
+    R --> J
   end
   P -- "same-origin fetch, every 2s" --> R
 ```
@@ -86,8 +94,8 @@ The two halves are independent files with independent lifecycles:
 
 | Half | File | Loaded by | Responsibility |
 | --- | --- | --- | --- |
-| Host | `index.js` | the DSH host plugin loader (Cordis bundle) | Register the HTTP route; build the version 2 JSON snapshot per request from live services. |
-| Client | `client.js` | the DSH Web module loader | Register locale dictionaries, the sidebar entry, and the main panel; poll, filter by project, and render the active-first snapshot. |
+| Host | `index.js` | the DSH host plugin loader (Cordis bundle) | Register the HTTP route; build the version 3 JSON snapshot per request from live services and optional projections. |
+| Client | `client.js` | the DSH Web module loader | Register locale dictionaries, the sidebar entry, and the main panel; poll, filter by project, and render the workspace-first visual stage. |
 
 The package manifest wires both halves: `dsh.bundle.patch` points at `cordis.patch.yml`, which
 inserts the bundle row into the profile loader, and `exports["./client"]` points at the browser
@@ -114,11 +122,11 @@ on the locale package.
 
 ### 5.2 Snapshot document
 
-Contract version 2 (`VERSION = 2`). A healthy response is HTTP 200 with:
+Contract version 3 (`VERSION = 3`). A healthy response is HTTP 200 with:
 
 ```jsonc
 {
-  "version": 2,
+  "version": 3,
   "ok": true,
   "generatedAt": 1730000000000,          // Date.now() at the host when the snapshot was built
   "unsupported": null,                    // string when Agent Teams services are absent
@@ -163,6 +171,23 @@ Contract version 2 (`VERSION = 2`). A healthy response is HTTP 200 with:
         "blocked": 1,
         "ready": 1
       },
+      "stats": {
+        "turns": 12,                    // sum over members that have the value
+        "steps": 34,
+        "tokens": {                     // null when no member reported token usage
+          "total": 123456,
+          "uncachedInput": 4567,
+          "cacheRead": 100000,
+          "cacheWrite": 2000,
+          "output": 16889
+        },
+        "llmMs": 120000,
+        "toolMs": 30000,
+        "workingMs": 150000,
+        "idleMs": 900000,
+        "wallMs": 1050000,
+        "workingRatio": 0.1429         // workingMs / (workingMs + idleMs), 0..1, null without a denominator
+      },
       "members": [
         {
           "id": "session-abc",
@@ -178,7 +203,25 @@ Contract version 2 (`VERSION = 2`). A healthy response is HTTP 200 with:
           "lastEventType": "tool/result", // string | null (raw session event type)
           "turns": 7,                     // number | null
           "steps": 21,                    // number | null
-          "active": true                  // running or provisioning
+          "active": true,                 // running or provisioning
+          "stats": {
+            "turns": 8,                   // sessionStats.turns, or null
+            "steps": 21,                  // sessionStats.steps, or null
+            "tokens": {                   // null when no token usage is available
+              "total": 111111,
+              "uncachedInput": 4567,
+              "cacheRead": 90000,
+              "cacheWrite": 1000,
+              "output": 15544
+            },
+            "llmMs": 90000,
+            "toolMs": 20000,
+            "workingMs": 110000,          // llmMs + toolMs when both are known; null otherwise
+            "idleMs": 700000,             // max(0, wallMs - workingMs); null without wallMs
+            "wallMs": 810000,             // now - session.header.createdAt; null when unknown
+            "workingRatio": 0.1358,       // workingMs / (workingMs + idleMs), 0..1, null without a denominator
+            "live": true                  // member.active && wallMs !== null
+          }
         }
       ],
       "tasks": [
@@ -223,6 +266,11 @@ still names the completed blockers. In-progress and completed tasks always have 
 they are claimed or finished work, not blocked work; only pending tasks can be shown as blocked, and
 the blocked marker carries the blocker ids when they are known.
 
+Contract version 3 adds `stats` to every listed member and every listed team. Member stats are read
+from the optional `sessionProjections` service and are entirely best effort; team stats are aggregates
+of the member rows. `activity[]` stays in the wire contract for API consumers, but the version 1.2
+client no longer renders it.
+
 ### 5.3 Field rules
 
 - **IDs are strings.** Branded ids are converted with `String(...)`; missing ids become `""`, never
@@ -256,6 +304,22 @@ the blocked marker carries the blocker ids when they are known.
   and task counters are sums over the listed teams. Version 2 adds `activeTeams`, `pending`,
   `inProgress`, and `blocked`; `teams`, `members`, `running`, `tasks`, and `completed` already existed
   in version 1.
+- **Session stats.** Every listed member carries `stats`; every listed team carries an aggregate
+  `stats`. The values come only from the optional synchronous `sessionProjections` service
+  (`stateOf(session, 'sessionStats')` and `stateOf(session, 'tokenUsage')`), with two bounded
+  projection reads per member and no session-log scan for statistics. Missing projections, missing
+  sessions, and throwing reads all degrade to nulls (and `live: false`).
+  - Member `turns` and `steps` come from `sessionStats`. `tokens.total` is
+    `uncachedInput + cacheRead + cacheWrite + output` once any bucket is available; `tokens` itself is
+    null when no usage is available. `workingMs = llmMs + toolMs` when both are known, else null;
+    `wallMs = max(0, now - session.header.createdAt)` when the creation header carries a finite
+    `createdAt`, else null; `idleMs = max(0, wallMs - workingMs)` when both are known;
+    `workingRatio = workingMs / (workingMs + idleMs)` clamped to `[0, 1]` when the denominator is
+    positive, else null. `live = member.active && wallMs !== null`.
+  - Team stats sum each numeric field over the members that know it (null when nobody does), sum the
+    token buckets with the same total rule (null when no member has tokens), and recompute
+    `workingRatio` from the summed working and idle times. Team stats never derive member counts;
+    `counts` remains authoritative for the roster.
 - **Projects.** `projects[]` contains only projects that own at least one listed team; teams with no
   resolvable project are not grouped into a virtual project. Each project entry aggregates the listed
   teams with the same project id. Resolution is best effort and never throws:
@@ -269,25 +333,26 @@ the blocked marker carries the blocker ids when they are known.
      `id: "cwd:<cwd>"` project whose `title` is the directory basename and whose `path` is the cwd;
   4. with neither a workspace nor a cwd, set `project: null` and keep the team listed.
 - **Unsupported runtime.** When the Agent Teams service is missing, or exists but does not expose
-  the expected methods, the response is still `200`, still `version: 2`, still `ok: true`, with
+  the expected methods, the response is still `200`, still `version: 3`, still `ok: true`, with
   `unsupported` set to a short reason string (for example, `"Agent Teams service is not mounted"`)
   and empty `teams` and `projects` arrays.
 - **Per-team errors.** If reading one team's roster or task board throws, that team is still returned
   with `error` set and whatever data was readable; other teams are unaffected.
-- **Contract evolution.** Version 2 adds fields to the version 1 shape; it does not remove or rename
-  existing ones. The bundled client reads every field defensively and keeps local fallbacks for
-  `active` and the new counters, so a partial or older payload still renders.
+- **Contract evolution.** Version 2 added fields to the version 1 shape; version 3 adds `member.stats`
+  and `team.stats`. Neither version removes or renames existing fields. The bundled client reads every
+  field defensively and keeps local fallbacks (including for `active`, the counters, and the stats), so
+  a partial or older payload still renders.
 
 ### 5.4 Error responses
 
 - Admission rejection: HTTP 401 with
-  `{ "version": 2, "ok": false, "error": "unauthorized", "teams": [] }`, or HTTP 403 with
+  `{ "version": 3, "ok": false, "error": "unauthorized", "teams": [] }`, or HTTP 403 with
   `"error": "forbidden"`, written before routing when the DSH `connection` service rejects the
   request. Admission runs first, so an unauthenticated request never reaches the 404/500 paths below.
 - Unknown method or path: HTTP 404 with
-  `{ "version": 2, "ok": false, "error": "unknown ...", "teams": [] }`.
+  `{ "version": 3, "ok": false, "error": "unknown ...", "teams": [] }`.
 - Unexpected aggregation failure: HTTP 500 with
-  `{ "version": 2, "ok": false, "error": "...", "teams": [] }`.
+  `{ "version": 3, "ok": false, "error": "...", "teams": [] }`.
 - A response object that cannot be written to is handled defensively; the handler never throws or
   rejects into the Web server.
 
@@ -319,6 +384,9 @@ export function apply(ctx) {
 - The optional `workspaceRegistry` service is resolved per request and listed once per snapshot for
   project resolution. It is not required: a missing, throwing, or malformed registry degrades to the
   Lead session cwd fallback (see 5.3).
+- The optional `sessionProjections` service is resolved per request and used for the version 3
+  member/team statistics. It is not required: when it is missing, or `stateOf(...)` throws for a unit,
+  the stats degrade to nulls (see 5.3). The aggregation stays synchronous.
 - Registration happens inside `ctx.effect(...)`, so unloading the plugin disposes the route.
 - The Agent Teams services are optional and are resolved per request with `ctx.get(...)`, guarded at
   every use. They are never captured at load time, so a service that mounts later is picked up on the
@@ -329,8 +397,8 @@ export function apply(ctx) {
 Per request, the route handler first applies admission (see 5.1); only admitted requests reach the
 snapshot builder. `createSnapshot(ctx)` then:
 
-1. Resolves `agentTeams`, `agents`, and `sessions`; computes an `unsupported` reason if the required
-   Agent Teams API is not present.
+1. Resolves `agentTeams`, `agents`, `sessions`, and the optional `sessionProjections` service;
+   computes an `unsupported` reason if the required Agent Teams API is not present.
 2. Lists the optional `workspaceRegistry` entities once for the whole snapshot (guarded; an absent or
    failing registry simply yields no workspaces).
 3. Enumerates live agents through `agents.list()` and asks `agentTeams.tryMembership(agent)` for each
@@ -340,16 +408,18 @@ snapshot builder. `createSnapshot(ctx)` then:
    root agent status when the roster does not carry it).
 5. Decides whether the team is listable (more than one member or at least one task). Cheap counts are
    computed first, so the more expensive session reads are skipped for implicit one-person Leads.
-6. Enriches members from the `sessions` service, normalizes team activity from the Lead session's
-   event log, and resolves the team's `project` (workspace entity first, cwd fallback, else `null`).
-7. Computes the per-team counts and `active` flag, plus the `activityAt` sort key (the latest member or
-   activity timestamp). Sorts teams active first and then by `activityAt` descending, aggregates
-   `totals` and `projects`, and returns the JSON-safe document.
+6. Enriches members from the `sessions` service, builds each member's version 3 `stats` from the
+   optional projections, normalizes team activity from the Lead session's event log, and resolves the
+   team's `project` (workspace entity first, cwd fallback, else `null`).
+7. Aggregates the member stats into `team.stats`, computes the per-team counts and `active` flag,
+   plus the `activityAt` sort key (the latest member or activity timestamp). Sorts teams active first
+   and then by `activityAt` descending, aggregates `totals` and `projects`, and returns the JSON-safe
+   document.
 
 ### 6.3 Member enrichment from sessions
 
 For each member, the host reads a bounded tail of that member's session events (at most 60 trailing
-events) and fills in:
+events) and fills in the version 1 activity fields:
 
 - `lastActivityAt` and `lastEventType` from the newest event;
 - `turns` from the highest `turn/start` event seen;
@@ -358,9 +428,28 @@ events) and fills in:
   carry them.
 
 All of these reads are best effort. A missing session, a throwing accessor, or an unexpected event
-shape leaves the fields `null`.
+shape leaves the fields `null`. These legacy fields are separate from the version 3 `stats` row, which
+comes from the session projections instead (see 6.4).
 
-### 6.4 Activity normalization
+### 6.4 Session stats (contract version 3)
+
+Member and team statistics come only from the optional synchronous `sessionProjections` service, so
+the request path performs exactly two bounded projection reads per listed member and never scans a
+session log for stats:
+
+- `stateOf(session, 'sessionStats')` supplies `turns`, `steps`, `llmMs`, and `toolMs`.
+- `stateOf(session, 'tokenUsage')` supplies the token buckets; `tokens.total` is their sum once any
+  bucket is available.
+- `wallMs` comes from the immutable creation header (`max(0, now - header.createdAt)`).
+- `workingMs`, `idleMs`, `workingRatio`, and `live` are derived as described in 5.3.
+- `computeTeamStats` sums the member rows (null-safe), sums the token buckets, and recomputes the
+  team working ratio.
+
+Every read is wrapped in try/catch: a missing service, a session without projections, an unregistered
+unit key, or a throwing `stateOf` degrades that member to an all-null stats row and never fails the
+snapshot. The service is resolved once per snapshot and never becomes required.
+
+### 6.5 Activity normalization
 
 The activity list is built only from the Lead session log, and only from the two event types owned by
 the Agent Teams projection: `team/member` and `team/task`.
@@ -376,12 +465,13 @@ the Agent Teams projection: `team/member` and `team/task`.
 - Every entry carries a `text` fallback built from the id, action, and subject, capped at 200
   characters. The client can always render something even for a future event shape.
 - Events are filtered by team id when the payload carries one, capped to the newest 40 entries, and
-  returned newest first. The client renders at most the newest 8.
+  returned newest first. The version 1.2 client does not render this list; it remains in the wire
+  contract for API consumers.
 - To keep long-running Lead sessions cheap, the scan starts with the newest 400 events and expands by
   a factor of 4 until it has at least 12 activity entries, reaches the start of the log, or hits the
   20000-event ceiling.
 
-### 6.5 Project resolution
+### 6.6 Project resolution
 
 Every listed team gets a `project` object or `null`, resolved best effort from two optional sources:
 
@@ -400,7 +490,7 @@ Resolution is wrapped in try/catch and every registry read is guarded separately
 malformed entity or a throwing registry accessor degrades to the fallback instead of failing the
 snapshot.
 
-### 6.6 Defensive parsing and JSON safety
+### 6.7 Defensive parsing and JSON safety
 
 The host treats every service view and event payload as untrusted:
 
@@ -414,7 +504,7 @@ The host treats every service view and event payload as untrusted:
   converts bigints to strings, and breaks cycles with `null`.
 - The route wraps aggregation in try/catch and turns an unexpected failure into a valid JSON 500.
 
-### 6.7 Bounded work and no side effects
+### 6.8 Bounded work and no side effects
 
 - The host keeps no mutable module state, starts no timers, monitors nothing, and touches no files.
 - Every request rebuilds the snapshot from read-only service reads; concurrent requests cannot
@@ -423,6 +513,8 @@ The host treats every service view and event payload as untrusted:
   activity, 40 activity entries per team, and capped text fields in the output.
 - Project resolution adds one synchronous workspace-registry `list()` per snapshot and at most a
   handful of synchronous entity reads; the request path never awaits or calls async registry APIs.
+- Session stats add exactly two synchronous projection reads per listed member plus one creation-header
+  read; they never scan a session log, start timers, or add async work.
 
 ## 7. Client half
 
@@ -500,56 +592,57 @@ The panel renders, in order:
 
 1. A `<style>` element with the panel's styles, tagged with a data attribute so it is easy to spot and
    disposed together with the panel.
-2. The page header: title, subtitle, project filter (only when more than one project is listed), live
-   indicator (pulsing while any member is running), the last updated time, and a manual refresh
-   button.
+2. The page header: title, a one-line subtitle, the project filter (only when more than one project is
+   listed), live indicator (pulsing while any member is running), the last updated time, and a manual
+   refresh button.
 3. Optional banners: a stale-data hint, an unsupported-service notice.
-4. The compact status strip: four chips (in-progress tasks, running members, blocked tasks, pending
-   tasks) computed over the currently filtered teams; zero values are muted rather than hidden.
+4. The compact status strip: five chips (in-progress tasks, running members, token usage, blocked
+   tasks, pending tasks) computed over the currently filtered teams; zero values are muted rather than
+   hidden.
 5. Either the empty state, or one collapsible section per filtered team.
 
 The project filter is a native `<select>` with an `aria-label`. It starts at "All projects" and is
-rendered only when `projects[]` has more than one entry. Choosing a project filters the status strip
-and the team sections locally, without another request. Duplicate project titles are disambiguated
-with a short unique path tail in the option label; the filter is not persisted and resets when the
-panel remounts.
+rendered only when `projects[]` has more than one entry. Choosing a project filters the status strip,
+its token total, and the team sections locally, without another request. Duplicate project titles are
+disambiguated with a short unique path tail in the option label; the filter is not persisted and
+resets when the panel remounts.
 
-Each team section has an always-visible header and a collapsible body. The header shows a status dot,
-the project chip when known, the Lead name and role, in-progress, member, and blocked counters (blocked
-only when non-zero), the last activity time, and an expand/collapse control with `aria-expanded` and
+Each team section has an always-visible header and a collapsible body. The header starts with the
+prominent workspace/project name (falling back to "No project"), followed by the Lead name and role, a
+status dot, a working-vs-idle donut with a "work · idle" caption, team rounds, team token totals, an
+in-progress count when non-zero, and an expand/collapse control with `aria-expanded` and
 `aria-controls`. Active teams are expanded by default; idle teams are collapsed by default. Expansion
 state is local React state keyed by team id and persists for the mounted panel.
 
 The body renders, in order:
 
-1. A compact wrapping roster of member chips, active members first (running/provisioning, then idle,
-   then failed). Each chip shows the avatar initial, name, role tag, and a status dot with its label;
-   the model and last activity live in the tooltip. At most 8 members are rendered, with an "N more"
-   chip when the roster is longer.
-2. Task sections in-progress first: in-progress task cards (the strongest visual block, with subject,
-   owner, advisory write scopes, and an expandable description; they carry no blocked warning),
-   compact pending one-line rows (a ready marker when `ready === true`; otherwise a blocked marker
-   with the blocker ids when known), and a collapsed "Completed N" toggle per team that reveals dimmed
-   one-line rows.
-3. A compact activity list of at most 8 entries, newest first: relative time plus a composed label
-   (`task id · localized action · member`, falling back to the server-provided `text`); the entry
-   tooltip carries the subject and the short local date. Action labels are localized through the
-   dictionaries (`action.claim` reads "claimed" in English and "认领" in Chinese); the raw server-side
-   action label appears only in fallback text.
+1. An animated SVG agent stage: one node per member, Lead first (slightly larger, brand-tinted ring),
+   up to 8 nodes plus a "+N" overflow node. Node radius scales with token usage (log scale against the
+   team's busiest member); an outer arc shows the working ratio. Status is animated: running gets a
+   pulsing ring and an orbiting dot, provisioning spins a dashed ring, idle is muted and static, and
+   failed is a static error ring. Under each node sit the short name and a tiny stat line
+   (`N rounds · X tok`).
+2. A compact task summary line: in-progress, pending, and blocked counts plus an expand toggle.
+   Expanding reveals only the in-progress tasks as one-line rows (subject, owner); pending and
+   completed tasks stay as counts.
 
-In-progress and completed tasks always report `ready: false`, so the panel never renders a blocked
-marker for them; only pending tasks can be shown as ready or blocked.
+Hovering or focusing a stage node opens a detail card below the stage with the model, rounds, steps,
+token breakdown (uncached input, cache read, cache write, output, total), and working and idle time.
+Only pending tasks can be ready or blocked: an in-progress task is claimed work and never renders a
+blocked marker. The activity list is carried by the wire contract but is not rendered in version 1.2.
 
 The status strip and the team list both reflect the selected project; the empty state appears when the
 selection has no teams. Relative time thresholds: under 5 seconds is "just now"; under a minute shows
 seconds; then minutes, hours, and days; seven days or more falls back to a short localized date.
-Hovering a time shows the short local date.
+Token counters use compact SI-style formatting (`1.2M`, `34.5k`), and durations use `s`/`m`/`h`/`d`
+forms (localized in Chinese).
 
 ### 7.5 Optional navigation
 
-When the optional `uiWorkspace` service exposes `openSession`, clicking a member chip opens that
-member's session. Member chips become keyboard-focusable buttons in that case. Navigation is wrapped
-in try/catch and never affects rendering; without the service the roster is a pure read-only view.
+When the optional `uiWorkspace` service exposes `openSession`, clicking a stage node opens that
+member's session; nodes are keyboard-focusable buttons in that case. The hover/focus detail card is
+independent of navigation and never blocks it. Navigation is wrapped in try/catch and never affects
+rendering; without the service the stage is a pure read-only view.
 
 ### 7.6 Styling and theming
 
@@ -564,9 +657,15 @@ borders, and backgrounds come exclusively from DSH alias tokens:
 
 Counts and times use `font-variant-numeric: tabular-nums` so values do not jitter while polling.
 `color-mix()` is used only to derive translucent status tints from those same tokens. The filter,
-status strip, and team headers are one-line chip components with 1 px token borders; in-progress
-blocks use the brand tint and border, blocked markers use the warning color, and idle or completed
-content is muted. No gradients, no drop shadows, no hardcoded colors.
+status strip, team headers, and task summary are one-line chip/row components with 1 px token
+borders; the stage draws its SVG art exclusively with token fills and strokes.
+
+The stage anatomy is one `<svg>` per team with a faint connector line, one group per member, and a
+working-ratio arc plus status ring per node; node radius is a log scale between 16 and 26 px (plus a
+small Lead bonus). Status motion is CSS keyframes declared in the same `<style>` element: a running
+pulse plus an orbiting dot, a slow dashed-ring rotation for provisioning, and no motion for idle or
+failed. The working-vs-idle donut is a 34 px SVG arc in the success token over a muted track. No
+gradients, no drop shadows, no hardcoded colors.
 
 ### 7.7 Accessibility
 
@@ -574,40 +673,45 @@ content is muted. No gradients, no drop shadows, no hardcoded colors.
 - The project filter is a native `<select>` with a localized `aria-label`, and the refresh button has
   a localized `aria-label` plus `aria-busy` while loading.
 - Error cards use `role="alert"`; stale and unsupported notices use `role="status"`.
-- Each team header is a button with `aria-expanded` and `aria-controls`; the completed-tasks toggle is
-  a button with `aria-expanded` and a localized `aria-label`; the roster is a labeled `role="group"`.
-- Member chips are buttons with a descriptive `aria-label` when session navigation is available, and
-  the task description toggles expose `aria-expanded`.
-- Decorative SVGs and status dots are `aria-hidden`; screen-reader-only text carries expand/collapse
-  labels; focus-visible outlines use the brand token.
-- `prefers-reduced-motion: reduce` disables the pulse, spin, skeleton, and caret transitions.
+- Each team header is a button with `aria-expanded` and `aria-controls`; the task-summary toggle is a
+  button with `aria-expanded` and a localized `aria-label`; the in-progress row list is a labeled
+  `role="list"`.
+- The stage `<svg>` is a labeled `role="group"`; each member node carries a descriptive `aria-label`
+  (name, status, rounds, tokens), is keyboard focusable, and shows the detail card on focus as well as
+  hover. Clickable nodes are buttons activated with Enter or Space.
+- Decorative SVG art and status dots are `aria-hidden`; screen-reader-only text carries
+  expand/collapse labels; focus-visible outlines use the brand token.
+- `prefers-reduced-motion: reduce` disables the pulse, spin, skeleton, caret, node pulse/orbit/dash,
+  and donut-arc animations (the pulse and orbit rings are hidden entirely).
 
 ## 8. Visual design
 
 The target is a calm, dense "mission control" page that looks native to the Harness Web UI rather than
-a chat toy. Version 1.1 moved from a card-grid dashboard to an in-progress-first, single-screen layout.
+a chat toy. Version 1.1 moved from a card-grid dashboard to an in-progress-first, single-screen
+layout; version 1.2 makes the page visual-first by turning each team body into an agent stage.
 
 - **Page:** scroll container on the base background; content max-width 1120 px centered; 20-24 px
   padding on wide screens; 14 px between page blocks.
-- **Typography:** 13 px body, 12 px meta text, 18 px page title, 600-weight section titles, 10-11 px
-  uppercase role tags.
+- **Typography:** 13 px body, 12 px meta text, 18 px page title, 15 px workspace name, 600-weight
+  section titles, 10-11 px uppercase role tags.
 - **Components:** compact chips, one-line headers, 1 px token borders, 8-10 px radius, layer-1
   backgrounds; 8-10 px inner gaps.
-- **Status strip:** one row of four inline chips with 13 px semibold tabular values; in-progress uses
-  the brand color, running uses success, blocked uses warning, and zero values are muted.
-- **Team sections:** collapsible cards; the header is a single row of dot, project chip, Lead, counters,
-  last activity, and caret; the body adds 2-12 px padding; the active section uses the stronger border
-  token.
-- **Roster:** a wrapping row of pill chips with 18 px avatars; idle chips are muted and failed chips get
-  an error-tinted border.
-- **Tasks:** in-progress cards carry a brand left border and tint; pending and completed rows are
-  compact one-line lists separated by 1 px borders, and completed rows are dimmed.
-- **Activity:** the smallest visual weight: an 11.5 px one-line list with a fixed 64 px relative-time
-  column.
+- **Status strip:** one row of five inline chips with 13 px semibold tabular values; in-progress uses
+  the brand color, running uses success, token usage uses the primary label, blocked uses warning, and
+  zero values are muted. Chips wrap on narrow screens.
+- **Team sections:** collapsible cards; the header starts with the prominent workspace name, then the
+  Lead, status dot, 34 px working-vs-idle donut, "work · idle" caption, rounds, token totals,
+  in-progress count, and caret; the active section uses the stronger border token.
+- **Agent stage:** a horizontal row of SVG nodes on a shared connector line, scaled to the member
+  count, with a max height around 180 px. Avatars use the member initial; the outer ring shows the
+  working ratio; node size grows with token usage on a log scale; Lead nodes are slightly larger with
+  a brand ring. Each node has a small name and a 10 px stat line under it.
+- **Task summary:** a single 12 px line with counts and a caret; expanded in-progress rows are compact
+  12 px one-line rows separated by 1 px borders. There is no full task board and no activity list.
 
 Responsive behavior: below 900 px the page padding shrinks, the header side takes the full row width,
-the project select can stretch, and the activity time column narrows; the layout is otherwise a single
-column by design and needs no stacking breakpoints. No element relies on hover to be usable.
+the project select and workspace name can stretch, and the detail grid narrows; the stage scales with
+its container width and stays a single row. No element relies on hover to be usable.
 
 ## 9. Privacy and security posture
 
@@ -623,7 +727,7 @@ column by design and needs no stacking breakpoints. No element relies on hover t
   logic. On a host without that service, the route leaves admission to the deployment's own access
   control. The plugin adds no other authentication layer and no cross-origin access.
 - **Bounded reads.** Session reads are windowed and capped, activity is capped, text fields are capped,
-  and the output is JSON-safe.
+  stats add two synchronous projection reads per member, and the output is JSON-safe.
 - **Display-only metadata.** Provider, model, and task text are shown, not evaluated or executed. All
   rendering goes through React text nodes; the panel does not use `dangerouslySetInnerHTML`.
 
@@ -637,14 +741,16 @@ column by design and needs no stacking breakpoints. No element relies on hover t
 - The Agent Teams services and their session-event payloads are experimental. Parsing is defensive on
   purpose: a changed payload shape should degrade to a fallback label, not break the panel. When a
   shape change is discovered, update both the parser and the tests.
-- The snapshot contract has an explicit `version`. Package 1.1.0 ships **contract version 2**, which
-  adds fields to the version 1 shape without renaming or removing existing ones: `projects[]`,
-  per-team `project` and `active`, per-member and per-task `active`, `counts.idle` and `counts.ready`,
-  the extra `totals` counters, and active-first team ordering. Additive fields are safe for existing
-  readers, which should ignore what they do not know; renaming or removing a field requires another
-  contract version bump and a matching client update.
-- Package versions are independent of the contract version (package 1.0.0 shipped contract 1,
-  package 1.1.0 ships contract 2).
+- The snapshot contract has an explicit `version`. Package 1.2.0 ships **contract version 3**, which
+  adds `member.stats` and `team.stats` (rounds, steps, token usage, working / idle / wall time,
+  working ratio, and the member `live` flag) to the version 2 shape. Version 2 itself added
+  `projects[]`, per-team `project` and `active`, per-member and per-task `active`, `counts.idle` and
+  `counts.ready`, the extra `totals` counters, and active-first ordering. Neither version removes or
+  renames existing fields; additive fields are safe for existing readers, which should ignore what
+  they do not know. Renaming or removing a field requires another contract version bump and a matching
+  client update.
+- Package versions are independent of the contract version (package 1.0.0 shipped contract 1, package
+  1.1.0 shipped contract 2, package 1.2.0 ships contract 3).
 - Releases follow Semantic Versioning and are documented in [CHANGELOG.md](../CHANGELOG.md) in the
   Keep a Changelog format.
 - The manifest wiring (`dsh.bundle.patch`, `dsh.client.platform`, `dsh.client.immediately`,
@@ -658,10 +764,12 @@ column by design and needs no stacking breakpoints. No element relies on hover t
   (empty `teams` and `projects`), empty rosters, fake teams with members and tasks, project resolution
   (workspace `sessionIds` precedence, case-insensitive path matching, the Windows cwd fallback,
   `project: null`, and a throwing/malformed registry), the `idle`/`ready`/`blocked` count semantics
-  and component `active` flags, `projects` aggregation and ordering, active-first team ordering,
-  unknown event shapes, JSON safety, text caps, version 2 route behavior (200/404/500), and connection
-  admission (401, 403, and fail-closed when the admission check throws). It uses `node:test` and
-  `node:assert/strict` only.
+  and component `active` flags, `projects` aggregation and ordering, active-first team ordering, the
+  version 3 session stats (projection mapping, token sums, work/idle/ratio math and clamping, the
+  `live` flag, missing/throwing projections, missing `createdAt`, zero usage, and team aggregation
+  with mixed nulls), unknown event shapes, JSON safety, text caps, version 3 route behavior
+  (200/404/500), and connection admission (401, 403, and fail-closed when the admission check throws).
+  The suite currently has 39 tests and uses `node:test` and `node:assert/strict` only.
 - **Client checks.** `client.js` is syntax-checked with `node --check`; the manifest guard also proves
   that the embedded Chinese and English dictionaries have identical key sets.
 - **Manifest guard.** `scripts/ci-guard.mjs` runs 32 checks over cross-file invariants (manifest
@@ -670,40 +778,48 @@ column by design and needs no stacking breakpoints. No element relies on hover t
 - **CI.** The GitHub Actions workflow runs syntax checks, the manifest guard, and the test suite on
   Node 22 and Node 24. There is no `npm install` step, because there are no dependencies.
 - **Live verification.** `scripts/verify-live.mjs` is a dependency-free probe that fetches the
-  snapshot route of a running server and validates the v2 contract field by field. It distinguishes a
-  contract failure from a 401 admission response.
+  snapshot route of a running server and validates the v3 contract field by field, including the new
+  stats shape and team aggregation consistency. It distinguishes a contract failure from a 401
+  admission response.
 - **Manual smoke test.** Install the package into a DSH profile, restart the app, open the panel, and
-  confirm the project filter, status strip, collapsed/expanded teams, and both themes. Host log lines
-  are prefixed `[agent-team-console]`.
+  confirm the workspace-first headers, the stage animations and node sizing, the hover/focus detail
+  card, the task summary expand, and both themes. Host log lines are prefixed
+  `[agent-team-console]`.
 
 ## 12. Limitations and future work
 
-Known limitations of version 1.1.0:
+Known limitations of version 1.2.0:
 
 - **Polling, not push.** Data is up to roughly 2 seconds old, and the host rebuilds the snapshot for
   each request. Polling stops while the tab is hidden.
 - **Requires the official Agent Teams bundle.** Without it, the panel shows an unsupported notice.
 - **Only real teams are listed.** Implicit one-person Lead sessions are filtered out.
-- **Derived activity is short.** The activity list comes from a bounded scan of the Lead session log;
-  it is not a durable event store. At most the newest 40 entries are assembled on the host, and the
-  panel shows the newest 8.
+- **Stats are best effort.** Turns, steps, token usage, and working / idle / wall time come from the
+  optional `sessionProjections` service (`sessionStats` and `tokenUsage`). When the service or a
+  projection unit is unavailable, member and team stats contain nulls, and the stage and detail card
+  show dashes. Stats never scan the session log and never block the snapshot.
+- **Team stats are aggregates.** A team stat is the null-safe sum of its members' known values; it is
+  not an independent measurement, and a mixed roster can therefore leave some fields unknown.
+- **Activity is API-only.** The snapshot still carries the bounded activity list (at most 40 entries
+  per team) for API consumers, but the version 1.2 panel does not render it.
+- **The stage shows up to 8 members.** Larger teams show a "+N" overflow node instead of every member.
 - **Project resolution is best effort.** Without the optional `workspaceRegistry` service the host
   falls back to the Lead session cwd; teams with neither a workspace nor a cwd show `project: null`
   and are visible only under the all-projects filter.
 - **The project filter is client-side.** It is not persisted, resets when the panel remounts, and is
   hidden when only one project has live teams.
-- **Collapsed by design.** Idle teams start collapsed and completed tasks sit behind a toggle; the
-  detail is one click away rather than always on screen.
+- **Collapsed by design.** Idle teams start collapsed and the task summary stays folded until
+  expanded; the detail is one click away rather than always on screen.
 - **No mailbox timeline, no member messages.**
 - **Optional navigation only.** Opening a member session depends on the optional `uiWorkspace`
   service.
 - **Fallback labels for unknown shapes.** A future event shape may show as a generic update label
   until the parser is taught about it.
 - **Web UI only.** The plugin has no CLI or headless surface.
-- **Experimental upstream.** The Agent Teams services may change; the declared DSH range
-  `<0.3.0-0` excludes 0.3.0 prereleases and later until they are tested.
+- **Experimental upstream.** The Agent Teams and projection services may change; the declared DSH
+  range `<0.3.0-0` excludes 0.3.0 prereleases and later until they are tested.
 
-Possible future work that stays inside the project's constraints: richer activity labels for new
-event shapes, additional read-only grouping, and more granular project context. Anything that requires
-mutations, push subscriptions, external services, persistence, or runtime dependencies is out of
-scope by design.
+Possible future work that stays inside the project's constraints: more projection-backed statistics,
+richer stage interactions, additional read-only grouping, and more granular project context. Anything
+that requires mutations, push subscriptions, external services, persistence, or runtime dependencies
+is out of scope by design.

@@ -6,7 +6,7 @@
  *
  *   GET <TEAM_CONSOLE_URL>/api/team-console/snapshot
  *
- * and validates the v2 snapshot contract field by field. Dependency-free: it
+ * and validates the v3 snapshot contract field by field. Dependency-free: it
  * needs only Node.js 22+ (global fetch + AbortController), so it can run on any
  * machine that can reach the Harness Web server.
  *
@@ -20,7 +20,7 @@
  *                     appended, so pass a base URL only.
  *
  * Exit codes:
- *   0  the route is reachable and the snapshot matches the v2 contract
+ *   0  the route is reachable and the snapshot matches the v3 contract
  *   1  the route is unreachable, the response is not JSON, or the contract is
  *      violated
  *   2  the server answered 401/403: DSH connection admission rejected the
@@ -106,7 +106,7 @@ try {
 
 // ---- envelope ---------------------------------------------------------
 note(isObj(body), 'body is an object')
-note(body.version === 2, `version === 2 (got ${JSON.stringify(body.version)})`)
+note(body.version === 3, `version === 3 (got ${JSON.stringify(body.version)})`)
 note(typeof body.ok === 'boolean', 'ok is boolean')
 note(isNum(body.generatedAt), 'generatedAt is a number')
 note(
@@ -186,6 +186,22 @@ for (const [i, team] of teams.entries()) {
     note(previousActive, `${tag} active teams are ordered before inactive teams`)
   }
 
+  // v3 stats: aggregate wall times and token usage from the session projections.
+  note(isObj(team.stats), `${tag}.stats is an object`)
+  if (isObj(team.stats)) {
+    for (const k of ['turns', 'steps', 'llmMs', 'toolMs', 'workingMs', 'idleMs', 'wallMs']) {
+      note(isNumOrNull(team.stats[k]), `${tag}.stats.${k} is number|null`)
+    }
+    note(isNumOrNull(team.stats.workingRatio), `${tag}.stats.workingRatio is number|null`)
+    if (isNum(team.stats.workingRatio)) {
+      note(
+        team.stats.workingRatio >= 0 && team.stats.workingRatio <= 1,
+        `${tag}.stats.workingRatio is within 0..1`,
+      )
+    }
+    note(team.stats.tokens === null || isObj(team.stats.tokens), `${tag}.stats.tokens is object|null`)
+  }
+
   // project: null when the workspace could not be resolved, else an object
   note(team.project === null || isObj(team.project), `${tag}.project is object|null`)
   if (isObj(team.project)) {
@@ -225,6 +241,33 @@ for (const [i, team] of teams.entries()) {
     note(isStrOrNull(m.lastEventType), `${t2}.lastEventType string|null`)
     note(isNumOrNull(m.turns), `${t2}.turns number|null`)
     note(isNumOrNull(m.steps), `${t2}.steps number|null`)
+
+    // v3 per-member stats, read from the session projections by the Host.
+    note(isObj(m.stats), `${t2}.stats is an object`)
+    if (isObj(m.stats)) {
+      for (const k of ['turns', 'steps', 'llmMs', 'toolMs', 'workingMs', 'idleMs', 'wallMs']) {
+        note(isNumOrNull(m.stats[k]), `${t2}.stats.${k} number|null`)
+      }
+      note(isNumOrNull(m.stats.workingRatio), `${t2}.stats.workingRatio number|null`)
+      if (isNum(m.stats.workingRatio)) {
+        note(
+          m.stats.workingRatio >= 0 && m.stats.workingRatio <= 1,
+          `${t2}.stats.workingRatio is within 0..1`,
+        )
+      }
+      note(typeof m.stats.live === 'boolean', `${t2}.stats.live boolean`)
+      note(m.stats.tokens === null || isObj(m.stats.tokens), `${t2}.stats.tokens object|null`)
+      if (isObj(m.stats.tokens)) {
+        for (const k of ['total', 'uncachedInput', 'cacheRead', 'cacheWrite', 'output']) {
+          note(isNum(m.stats.tokens[k]), `${t2}.stats.tokens.${k} number`)
+        }
+        note(
+          m.stats.tokens.total ===
+            m.stats.tokens.uncachedInput + m.stats.tokens.cacheRead + m.stats.tokens.cacheWrite + m.stats.tokens.output,
+          `${t2}.stats.tokens.total equals the bucket sum`,
+        )
+      }
+    }
   }
   note(Array.isArray(team.tasks), `${tag}.tasks is an array`)
   for (const [j, t2] of (team.tasks || []).entries()) {
@@ -257,11 +300,11 @@ for (const [i, team] of teams.entries()) {
     note(isStrOrNull(a.status), `${ta}.status string|null`)
   }
   console.log(
-    `${tag} ${team.id}: project=${team.project?.title ?? '(none)'} active=${team.active} lead=${leads[0]?.name} members=${team.members?.length} inProgress=${team.counts?.inProgress} pending=${team.counts?.pending}`,
+    `${tag} ${team.id}: project=${team.project?.title ?? '(none)'} active=${team.active} lead=${leads[0]?.name} members=${team.members?.length} inProgress=${team.counts?.inProgress} pending=${team.counts?.pending} turns=${team.stats?.turns ?? '-'} tokens=${team.stats?.tokens?.total ?? '-'} workRatio=${team.stats?.workingRatio ?? '-'}`,
   )
   for (const m of team.members || []) {
     console.log(
-      `   - ${m.role.padEnd(8)} ${String(m.name).padEnd(16)} ${String(m.status).padEnd(13)} active=${m.active ? 'yes' : 'no '} model=${m.model ?? '-'} last=${m.lastEventType ?? '-'}`,
+      `   - ${m.role.padEnd(8)} ${String(m.name).padEnd(16)} ${String(m.status).padEnd(13)} active=${m.active ? 'yes' : 'no '} turns=${m.stats?.turns ?? '-'} tokens=${m.stats?.tokens?.total ?? '-'} ratio=${m.stats?.workingRatio ?? '-'} model=${m.model ?? '-'}`,
     )
   }
   for (const t2 of team.tasks || []) {
@@ -269,7 +312,7 @@ for (const [i, team] of teams.entries()) {
       `   * ${t2.id} [${t2.status}] active=${t2.active ? 'yes' : 'no '} ready=${t2.ready} owner=${t2.ownerName ?? '-'} ${t2.subject}`,
     )
   }
-  for (const a of (team.activity || []).slice(0, 5)) {
+  for (const a of (team.activity || []).slice(0, 3)) {
     console.log(`   > ${new Date(a.time).toISOString()} ${a.kind}/${a.action} ${a.text}`)
   }
 }
@@ -334,6 +377,46 @@ if (teams.length > 0 && isObj(body.totals)) {
     note(project.activeTeams === expected.activeTeams, `projects[${project.id}].activeTeams matches team rows`)
     note(project.running === expected.running, `projects[${project.id}].running matches member rows`)
     note(project.inProgress === expected.inProgress, `projects[${project.id}].inProgress matches task rows`)
+  }
+
+  // v3 team stats must be the aggregate of the member stats (nulls stay null).
+  const numericStats = ['turns', 'steps', 'llmMs', 'toolMs', 'workingMs', 'idleMs', 'wallMs']
+  for (const [i, team] of teams.entries()) {
+    const tag = `teams[${i}]`
+    const teamStats = isObj(team.stats) ? team.stats : null
+    const rows = (team.members || []).map((m) => (isObj(m.stats) ? m.stats : null)).filter(Boolean)
+    if (teamStats === null) {
+      note(false, `${tag}.stats missing for aggregate check`)
+      continue
+    }
+    for (const key of numericStats) {
+      const values = rows.map((s) => s[key]).filter(isNum)
+      const expected = values.length > 0 ? values.reduce((a, b) => a + b, 0) : null
+      note(teamStats[key] === expected, `${tag}.stats.${key} equals the sum of member stats`)
+    }
+    const tokenRows = rows.map((s) => s.tokens).filter(isObj)
+    if (tokenRows.length === 0) {
+      note(teamStats.tokens === null, `${tag}.stats.tokens is null without member usage`)
+    } else if (!isObj(teamStats.tokens)) {
+      note(false, `${tag}.stats.tokens missing while members report usage`)
+    } else {
+      for (const key of ['uncachedInput', 'cacheRead', 'cacheWrite', 'output']) {
+        const expected = tokenRows.reduce((n, t) => n + (isNum(t[key]) ? t[key] : 0), 0)
+        note(teamStats.tokens[key] === expected, `${tag}.stats.tokens.${key} equals the sum of member tokens`)
+      }
+      note(
+        teamStats.tokens.total ===
+          teamStats.tokens.uncachedInput + teamStats.tokens.cacheRead + teamStats.tokens.cacheWrite + teamStats.tokens.output,
+        `${tag}.stats.tokens.total equals the bucket sum`,
+      )
+    }
+    if (isNum(teamStats.workingMs) && isNum(teamStats.idleMs) && teamStats.workingMs + teamStats.idleMs > 0) {
+      const ratio = teamStats.workingMs / (teamStats.workingMs + teamStats.idleMs)
+      note(
+        isNum(teamStats.workingRatio) && Math.abs(teamStats.workingRatio - ratio) < 1e-3,
+        `${tag}.stats.workingRatio matches workingMs / (workingMs + idleMs)`,
+      )
+    }
   }
 }
 

@@ -5,12 +5,23 @@
  *
  *   GET /api/team-console/snapshot
  *
- * and answers with a self-contained JSON snapshot (contract version 2) of every
+ * and answers with a self-contained JSON snapshot (contract version 3) of every
  * live Agent Team that the Host services `agentTeams` / `agents` / `sessions`
- * and the optional `workspaceRegistry` can see. The Client half (`client.js`)
- * polls this endpoint; this file never touches the disk, never starts timers,
- * and keeps no mutable module state — every request rebuilds the snapshot from
- * the live services.
+ * and the optional `workspaceRegistry` / `sessionProjections` can see. The
+ * Client half (`client.js`) polls this endpoint; this file never touches the
+ * disk, never starts timers, and keeps no mutable module state — every request
+ * rebuilds the snapshot from the live services.
+ *
+ * Contract version 3 additions (see docs/design.md):
+ *  - Every listed member carries `stats` and every listed team carries an
+ *    aggregated `stats`: turns/steps, `tokens` ({ total, uncachedInput,
+ *    cacheRead, cacheWrite, output } or null), `llmMs`, `toolMs`, `workingMs`,
+ *    `idleMs`, `wallMs`, `workingRatio` and (members only) `live`.
+ *  - Stats come only from the optional synchronous `sessionProjections` service
+ *    (`stateOf(session, 'sessionStats')` and `stateOf(session, 'tokenUsage')`):
+ *    exactly two bounded projection reads per member, no additional session-log
+ *    scans. Wall time is `max(0, now - session.header.createdAt)`; a missing or
+ *    throwing projection degrades to nulls and never throws.
  *
  * Contract version 2 additions (see docs/design.md):
  *  - Every listed team carries `project` (`{ id, title, path }` or null). It is
@@ -35,11 +46,13 @@
  *
  * Design constraints (see docs/design.md):
  *  - Zero `import` statements, so plain `node` can import and unit-test this file.
- *  - `agentTeams` / `agents` / `sessions` / `workspaceRegistry` are OPTIONAL:
- *    resolved per request with `ctx.get(name)` and guarded. Missing Agent Teams
- *    support degrades to `unsupported` instead of throwing; a missing workspace
- *    registry degrades to the cwd fallback. The whole aggregation stays
- *    synchronous: no async request work, timers, disk access or mutations.
+ *  - `agentTeams` / `agents` / `sessions` / `workspaceRegistry` /
+ *    `sessionProjections` are OPTIONAL: resolved per request with
+ *    `ctx.get(name)` and guarded. Missing Agent Teams support degrades to
+ *    `unsupported` instead of throwing; a missing workspace registry degrades to
+ *    the cwd fallback; missing projections degrade the stats to nulls. The
+ *    whole aggregation stays synchronous: no async request work, timers, disk
+ *    access or mutations.
  *  - When the DSH `connection` service is mounted, every request passes its
  *    Host/Origin fence and browser-session admission before the route answers,
  *    so an anonymous HTTP client is rejected the same way as the Web UI itself.
@@ -54,7 +67,7 @@
 export const inject = ['webServer']
 
 /** Snapshot contract version. */
-export const VERSION = 2
+export const VERSION = 3
 
 /** Valid JSON body used only when a response body cannot be encoded at all. */
 const ENCODING_FALLBACK = `{"version":${VERSION},"ok":false,"error":"snapshot could not be encoded","teams":[]}`
@@ -281,21 +294,31 @@ function readSessionEvents(session, windowSize) {
 }
 
 /**
+ * Look up one live Session by id, swallowing a throwing/failing service.
+ * @param sessions - optional `sessions` service.
+ * @param id - session or member id.
+ * @returns the live Session, or undefined when unavailable.
+ */
+function getSessionSafe(sessions, id) {
+  if (!sessions || typeof sessions.get !== 'function') return undefined
+  try {
+    const session = sessions.get(id)
+    return session === undefined || session === null ? undefined : session
+  } catch {
+    return undefined
+  }
+}
+
+/**
  * Enrich one roster row with live Session activity: lastActivityAt /
  * lastEventType / turns / steps, plus provider/model from the session request
- * header when the roster view does not carry them.
+ * header when the roster view does not carry them. This is the v1/v2 session
+ * scan (bounded tail); v3 `stats` come from the projections instead.
  * @param member - normalized member row, mutated in place.
- * @param sessions - optional `sessions` service.
+ * @param session - live member Session, or undefined.
  */
-function enrichMemberFromSession(member, sessions) {
-  if (!isRecord(member) || !sessions || typeof sessions.get !== 'function') return
-  let session
-  try {
-    session = sessions.get(member.id)
-  } catch {
-    session = undefined
-  }
-  if (!session) return
+function enrichMemberFromSession(member, session) {
+  if (!isRecord(member) || !session) return
   const events = readSessionEvents(session, MEMBER_SCAN_EVENTS)
   if (events.length > 0) {
     const last = events[events.length - 1]
@@ -335,6 +358,222 @@ function enrichMemberFromSession(member, sessions) {
   } catch {
     /* request header is optional */
   }
+}
+
+// ---------------------------------------------------------------------------
+// Session stats (v3): optional session projections only, never the session log
+// ---------------------------------------------------------------------------
+//
+// The optional Host `sessionProjections` service exposes synchronous
+// `stateOf(session, key)` reads. Two stock projection units feed the stats:
+//   sessionStats -> { turns, steps, llmMs, toolMs, ttftMs, ttftSteps, decodeMs, decodeTokens }
+//   tokenUsage   -> { uncachedInputTokens, outputTokens, cacheReadTokens, cacheWriteTokens }
+// Both are mounted by the stock web composition, but the service and the units
+// are optional: missing/throwing reads degrade to nulls and never throw. Stats
+// are deliberately NOT derived from a session-log scan (unlike the v1
+// lastActivityAt/turns/steps enrichment above), so the request path stays at
+// two bounded projection reads per member.
+
+/** Finite non-negative stats number, or null (keeps the payload JSON-safe). */
+function toStatNumber(value) {
+  const number = toFiniteNumber(value)
+  return number === null || number < 0 ? null : number
+}
+
+/** Truncated non-negative count, or null (turns/steps are whole counts). */
+function toStatCount(value) {
+  const number = toStatNumber(value)
+  return number === null ? null : Math.trunc(number)
+}
+
+/** The all-null member stats row (projections unavailable or unusable). */
+function emptyMemberStats() {
+  return {
+    turns: null,
+    steps: null,
+    tokens: null,
+    llmMs: null,
+    toolMs: null,
+    workingMs: null,
+    idleMs: null,
+    wallMs: null,
+    workingRatio: null,
+    live: false,
+  }
+}
+
+/** The all-null team stats aggregate. */
+function emptyTeamStats() {
+  return {
+    turns: null,
+    steps: null,
+    tokens: null,
+    llmMs: null,
+    toolMs: null,
+    workingMs: null,
+    idleMs: null,
+    wallMs: null,
+    workingRatio: null,
+  }
+}
+
+/**
+ * Read one projection state for one session. Missing services/sessions,
+ * unregistered keys and throwing registries/units all degrade to null.
+ * @param sessionProjections - optional `sessionProjections` service.
+ * @param session - live member Session (may be undefined).
+ * @param key - projection unit key ('sessionStats' | 'tokenUsage').
+ */
+function readProjectionState(sessionProjections, session, key) {
+  if (!isRecord(session) || !sessionProjections || typeof sessionProjections.stateOf !== 'function') return null
+  try {
+    const state = sessionProjections.stateOf(session, key)
+    return isRecord(state) ? state : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Normalize the tokenUsage projection into the contract token row. Missing
+ * buckets count as 0 once at least one bucket is present; the value is null
+ * when the projection is unavailable or carries no bucket at all.
+ */
+function normalizeTokenStats(state) {
+  const usage = isRecord(state) ? state : {}
+  const uncachedInput = toStatNumber(usage.uncachedInputTokens)
+  const cacheRead = toStatNumber(usage.cacheReadTokens)
+  const cacheWrite = toStatNumber(usage.cacheWriteTokens)
+  const output = toStatNumber(usage.outputTokens)
+  if (uncachedInput === null && cacheRead === null && cacheWrite === null && output === null) return null
+  const normalized = {
+    uncachedInput: uncachedInput ?? 0,
+    cacheRead: cacheRead ?? 0,
+    cacheWrite: cacheWrite ?? 0,
+    output: output ?? 0,
+  }
+  return {
+    total: normalized.uncachedInput + normalized.cacheRead + normalized.cacheWrite + normalized.output,
+    uncachedInput: normalized.uncachedInput,
+    cacheRead: normalized.cacheRead,
+    cacheWrite: normalized.cacheWrite,
+    output: normalized.output,
+  }
+}
+
+/**
+ * Wall-clock age of one session in ms: `max(0, now - header.createdAt)` when
+ * the immutable creation header carries a finite non-negative number, else
+ * null (a session without a readable creation header has unknown wall time).
+ */
+function sessionWallMs(session, now) {
+  if (!isRecord(session)) return null
+  try {
+    const header = session.header
+    if (!isRecord(header)) return null
+    const createdAt = toStatNumber(header.createdAt)
+    if (createdAt === null) return null
+    const reference = typeof now === 'number' && Number.isFinite(now) ? now : Date.now()
+    return Math.max(0, reference - createdAt)
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Working ratio clamped to [0,1] and rounded to 4 decimals; null without a
+ * positive denominator (unknown times or a zero-length observation window).
+ */
+function statWorkingRatio(workingMs, idleMs) {
+  if (workingMs === null || idleMs === null) return null
+  const denominator = workingMs + idleMs
+  if (!(denominator > 0)) return null
+  const ratio = Math.min(1, Math.max(0, workingMs / denominator))
+  return Math.round(ratio * 10000) / 10000
+}
+
+/**
+ * Build one member's contract `stats` from the optional session projections.
+ * Never throws and never scans the session log: exactly two bounded projection
+ * reads (sessionStats + tokenUsage) plus the creation-header createdAt.
+ * @param member - normalized member row (its `active` flag feeds `live`).
+ * @param session - live member Session, or undefined.
+ * @param sessionProjections - optional `sessionProjections` service.
+ * @param now - snapshot clock (Date.now() unless a caller pins it).
+ */
+function buildMemberStats(member, session, sessionProjections, now) {
+  try {
+    const stats = emptyMemberStats()
+    const sessionStats = readProjectionState(sessionProjections, session, 'sessionStats')
+    const tokenUsage = readProjectionState(sessionProjections, session, 'tokenUsage')
+    stats.tokens = normalizeTokenStats(tokenUsage)
+    if (sessionStats !== null) {
+      stats.turns = toStatCount(sessionStats.turns)
+      stats.steps = toStatCount(sessionStats.steps)
+      stats.llmMs = toStatNumber(sessionStats.llmMs)
+      stats.toolMs = toStatNumber(sessionStats.toolMs)
+    }
+    stats.workingMs = stats.llmMs !== null && stats.toolMs !== null ? stats.llmMs + stats.toolMs : null
+    stats.wallMs = sessionWallMs(session, now)
+    stats.idleMs = stats.wallMs !== null && stats.workingMs !== null ? Math.max(0, stats.wallMs - stats.workingMs) : null
+    stats.workingRatio = statWorkingRatio(stats.workingMs, stats.idleMs)
+    stats.live = member.active === true && stats.wallMs !== null
+    return stats
+  } catch {
+    return emptyMemberStats()
+  }
+}
+
+/** Add one nullable numeric stat; null stays "unknown" until a value appears. */
+function addStat(total, value) {
+  if (value === null) return total
+  return total === null ? value : total + value
+}
+
+/** Add one normalized nullable token row (all buckets always present). */
+function addTokenStats(total, tokens) {
+  if (tokens === null) return total
+  if (total === null) {
+    return {
+      total: tokens.total,
+      uncachedInput: tokens.uncachedInput,
+      cacheRead: tokens.cacheRead,
+      cacheWrite: tokens.cacheWrite,
+      output: tokens.output,
+    }
+  }
+  return {
+    total: total.total + tokens.total,
+    uncachedInput: total.uncachedInput + tokens.uncachedInput,
+    cacheRead: total.cacheRead + tokens.cacheRead,
+    cacheWrite: total.cacheWrite + tokens.cacheWrite,
+    output: total.output + tokens.output,
+  }
+}
+
+/**
+ * Aggregate member `stats` into the team `stats` row: numeric fields are sums
+ * over the members that know them (null when nobody does), token buckets are
+ * summed with the same total rule, and `workingRatio` is recomputed from the
+ * summed working/idle times. Never consults member/task counts.
+ * @param members - normalized member rows of one listed team.
+ */
+function computeTeamStats(members) {
+  const stats = emptyTeamStats()
+  for (const member of members) {
+    const memberStats = isRecord(member) && isRecord(member.stats) ? member.stats : null
+    if (memberStats === null) continue
+    stats.turns = addStat(stats.turns, memberStats.turns)
+    stats.steps = addStat(stats.steps, memberStats.steps)
+    stats.llmMs = addStat(stats.llmMs, memberStats.llmMs)
+    stats.toolMs = addStat(stats.toolMs, memberStats.toolMs)
+    stats.workingMs = addStat(stats.workingMs, memberStats.workingMs)
+    stats.idleMs = addStat(stats.idleMs, memberStats.idleMs)
+    stats.wallMs = addStat(stats.wallMs, memberStats.wallMs)
+    stats.tokens = addTokenStats(stats.tokens, memberStats.tokens)
+  }
+  stats.workingRatio = statWorkingRatio(stats.workingMs, stats.idleMs)
+  return stats
 }
 
 // ---------------------------------------------------------------------------
@@ -567,6 +806,7 @@ function normalizeMemberRow(view, leadId) {
     turns: null,
     steps: null,
     active: isMemberActive(status),
+    stats: emptyMemberStats(),
   }
 }
 
@@ -881,14 +1121,19 @@ function unsupportedReason(agentTeams, agents) {
  * Build one team entry plus its sort keys (active flag and most recent observed
  * activity time). Roster/task read failures become `team.error` and degrade to
  * whatever was readable; a team always lists its Lead row. Listed teams also
- * resolve `project` best effort (v2 contract).
+ * resolve `project` (v2) and member/team session `stats` (v3), both best effort.
  * @param membership - Agent Team membership row from `agentTeams.tryMembership`.
  * @param agentTeams - Agent Teams service.
- * @param sessions - optional `sessions` service.
- * @param workspaces - workspace registry entities from listWorkspaces().
+ * @param context - per-snapshot optional services and clock:
+ *   `{ sessions, workspaces, sessionProjections, now }`.
  * @returns `{ team, activityAt, listable }`.
  */
-function buildTeam(membership, agentTeams, sessions, workspaces) {
+function buildTeam(membership, agentTeams, context) {
+  const safeContext = isRecord(context) ? context : {}
+  const sessions = safeContext.sessions
+  const workspaces = safeContext.workspaces
+  const sessionProjections = safeContext.sessionProjections
+  const now = safeContext.now
   const rootAgent = isRecord(membership.root) ? membership.root : undefined
   const rootAgentId = rootAgent !== undefined ? rootAgent.id : undefined
   const teamId = toId(membership.id ?? rootAgentId)
@@ -933,21 +1178,22 @@ function buildTeam(membership, agentTeams, sessions, workspaces) {
 
   let activity = []
   let leadSession
+  let teamStats = emptyTeamStats()
   if (listable) {
     const memberNames = new Map()
     for (const member of members) memberNames.set(member.id, member.name)
-    for (const member of members) enrichMemberFromSession(member, sessions)
-    if (sessions && typeof sessions.get === 'function') {
-      try {
-        leadSession = sessions.get(teamId)
-      } catch {
-        leadSession = undefined
-      }
+    for (const member of members) {
+      const memberSession = getSessionSafe(sessions, member.id)
+      enrichMemberFromSession(member, memberSession)
+      // v3 stats: two bounded projection reads + the creation-header cwd/createdAt.
+      member.stats = buildMemberStats(member, memberSession, sessionProjections, now)
     }
+    leadSession = getSessionSafe(sessions, teamId)
     activity = normalizeActivity(leadSession, { memberNames, teamId })
+    teamStats = computeTeamStats(members)
   }
-  // Non-listable teams never reach the snapshot, so project resolution (and its
-  // workspace/session reads) is only paid for the teams the Client can see.
+  // Non-listable teams never reach the snapshot, so project resolution and the
+  // stats reads above are only paid for the teams the Client can see.
   const project = listable ? resolveTeamProject(teamId, leadSession, workspaces) : null
 
   const team = {
@@ -956,6 +1202,7 @@ function buildTeam(membership, agentTeams, sessions, workspaces) {
     project,
     active,
     counts,
+    stats: teamStats,
     members,
     tasks,
     activity,
@@ -977,16 +1224,23 @@ function buildTeam(membership, agentTeams, sessions, workspaces) {
  * member or at least one task (every ordinary runtime root is an implicit
  * one-person Lead, so unfiltered enumeration would surface unrelated sessions).
  * The optional workspace registry is listed once per snapshot for project
- * resolution; it never adds a required service.
+ * resolution and the optional `sessionProjections` service is resolved once for
+ * the v3 stats; neither ever becomes a required service.
  * @param ctx - Cordis plugin context.
+ * @param now - snapshot clock in ms; defaults to Date.now() (tests pin it).
  * @returns team objects, active first then most recent activity first.
  */
-export function collectTeams(ctx) {
+export function collectTeams(ctx, now = Date.now()) {
   const agentTeams = getService(ctx, 'agentTeams')
   const agents = getService(ctx, 'agents')
   if (unsupportedReason(agentTeams, agents) !== null) return []
-  const sessions = getService(ctx, 'sessions')
-  const workspaces = listWorkspaces(getService(ctx, 'workspaceRegistry'))
+  const clock = typeof now === 'number' && Number.isFinite(now) ? now : Date.now()
+  const buildContext = {
+    sessions: getService(ctx, 'sessions'),
+    workspaces: listWorkspaces(getService(ctx, 'workspaceRegistry')),
+    sessionProjections: getService(ctx, 'sessionProjections'),
+    now: clock,
+  }
 
   const liveAgents = agents.list()
   if (!Array.isArray(liveAgents)) return []
@@ -1005,7 +1259,7 @@ export function collectTeams(ctx) {
     const teamId = toId(membership.id ?? (isRecord(membership.root) ? membership.root.id : agent.id))
     if (teamId === '' || seen.has(teamId)) continue
     seen.add(teamId)
-    entries.push(buildTeam(membership, agentTeams, sessions, workspaces))
+    entries.push(buildTeam(membership, agentTeams, buildContext))
   }
 
   entries.sort((left, right) => {
@@ -1024,16 +1278,18 @@ export function collectTeams(ctx) {
  * Throws only on truly unexpected aggregation failures; the route turns those
  * into a valid HTTP 500 JSON body.
  * @param ctx - Cordis plugin context.
+ * @param now - snapshot clock in ms (also `generatedAt`); defaults to Date.now().
  */
-export function createSnapshot(ctx) {
+export function createSnapshot(ctx, now = Date.now()) {
+  const clock = typeof now === 'number' && Number.isFinite(now) ? now : Date.now()
   const agentTeams = getService(ctx, 'agentTeams')
   const agents = getService(ctx, 'agents')
   const unsupported = unsupportedReason(agentTeams, agents)
-  const teams = unsupported === null ? collectTeams(ctx) : []
+  const teams = unsupported === null ? collectTeams(ctx, clock) : []
   return toJsonSafe({
     version: VERSION,
     ok: true,
-    generatedAt: Date.now(),
+    generatedAt: clock,
     unsupported,
     totals: computeTotals(teams),
     projects: computeProjects(teams),

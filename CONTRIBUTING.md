@@ -12,7 +12,7 @@ request flow.
 In scope:
 
 - More accurate or more resilient snapshot aggregation in the host half.
-- Clearer presentation of roster, task board, and activity data in the panel.
+- Clearer presentation of the workspace-first stage, member statistics, and task summary in the panel.
 - Accessibility, keyboard, theme, and reduced-motion improvements.
 - Bilingual copy fixes (Chinese and English dictionaries must stay in sync).
 - Tests for defensive parsing and the HTTP contract.
@@ -78,7 +78,7 @@ are prefixed `[agent-team-console]`. To probe the snapshot route of a running se
 TEAM_CONSOLE_URL=http://127.0.0.1:10100 node scripts/verify-live.mjs
 ```
 
-It exits `0` when the v2 contract matches, `1` on an unreachable route or contract violation, and `2`
+It exits `0` when the v3 contract matches, `1` on an unreachable route or contract violation, and `2`
 when admission rejects the request as unauthenticated. A `2` is expected against a running DSH
 desktop app: the route enforces DSH connection admission, so an anonymous command-line probe is
 answered with a JSON 401 before any snapshot logic; it is not a plugin failure.
@@ -127,11 +127,15 @@ Match the existing style; there is no formatter configuration to run and no lint
   Teams support must produce a valid `unsupported` snapshot, not an error. The optional
   `workspaceRegistry` service is used for project resolution only and must stay optional: without it
   the host falls back to the Lead session cwd and otherwise returns `project: null`.
+- Session stats come only from the optional `sessionProjections` service (`stateOf(session,
+  'sessionStats')` and `stateOf(session, 'tokenUsage')`): two bounded projection reads per member, no
+  session-log scans for stats, and all-null degradation when the service or a unit is unavailable.
+  Team stats are null-safe aggregates of the member rows.
 - Keep the host stateless: no mutable module state, no timers, no filesystem access, no mutation of
   service objects. The whole aggregation stays synchronous; do not call async registry APIs.
 - Every response must be JSON-safe. Convert branded ids with `String(...)`, replace `undefined`
   with `null`, cap long strings, and catch unexpected aggregation errors into a valid JSON 500.
-- Keep the snapshot contract versioned (`VERSION`, currently `2`). Additive fields are fine;
+- Keep the snapshot contract versioned (`VERSION`, currently `3`). Additive fields are fine;
   removing or renaming a field requires a contract version bump and matching client support.
 
 ### Client half (`client.js`) rules
@@ -152,9 +156,14 @@ Match the existing style; there is no formatter configuration to run and no lint
   (`ready === true`) or a blocked marker (`ready === false`). In-progress and completed tasks must not
   render a blocked warning even though the runtime reports `ready: false` for them, and a retained
   `blockedBy` list alone must not be treated as blocked.
-- Keep member chips keyboard accessible (buttons with descriptive labels, focus-visible outlines) and
-  respect `prefers-reduced-motion`. Team headers and the completed-tasks toggle must expose
-  `aria-expanded` state.
+- The visual-first rules: the workspace/project name leads each team header; the agent stage is SVG
+  with one node per member; node size/ring/status motion comes from the contract stats; the activity
+  list must not be rendered (it stays in the wire contract only).
+- The stage and the working-vs-idle donut use only `--dsw-*` tokens for SVG fill/stroke, and every
+  animation (pulse, orbit, dashed spin, donut transition) must be disabled under
+  `prefers-reduced-motion`.
+- Keep stage nodes and team headers keyboard accessible (focusable nodes with descriptive labels and
+  focus-visible outlines; `aria-expanded` on team and task-summary toggles).
 - The project filter is local UI state only: never persist it or require host configuration for it.
 
 ### Tests
@@ -162,9 +171,11 @@ Match the existing style; there is no formatter configuration to run and no lint
 - Tests use `node:test` and `node:assert/strict` only; no test framework and no network access.
 - Drive the host from fake Cordis services and fake session logs, as the existing suite does.
 - Cover defensive behavior: project resolution (workspace matches, cwd fallback, missing/throwing
-  registry), active-first ordering, the `idle`/`ready` counts and `active` flags, unknown event
-  shapes, missing services, throwing services, connection admission (401, 403, and fail-closed on a
-  throwing check), JSON safety, and the 200/404/500 route shapes.
+  registry), active-first ordering, the `idle`/`ready` counts and `active` flags, session stats
+  (projection mapping, token sums, work/idle/ratio math and clamping, the `live` flag, and
+  missing/throwing projections), unknown event shapes, missing services, throwing services, connection
+  admission (401, 403, and fail-closed on a throwing check), JSON safety, and the 200/404/500 route
+  shapes.
 - A new snapshot field or behavior change should come with a test that would fail without the change.
 
 ### Manifest and DSH plugin rules
